@@ -1,648 +1,358 @@
-# =============================================================================
-# 美股即時監控系統 - 專業級 Streamlit 儀表板
-# 版本: 1.0 (2026-02-28)
-# 作者: Grok + Team (Harper, Benjamin, Lucas)
-# 依賴: pip install streamlit yfinance plotly pandas numpy requests feedparser groq openai
-# 使用方式: streamlit run app.py
-# =============================================================================
-
 import streamlit as st
 import yfinance as yf
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pandas as pd
-import numpy as np
-import time
-from datetime import datetime
+import pandas_ta as ta
+from datetime import datetime, timedelta
 import requests
-import feedparser
 import json
+import time
 from groq import Groq
-from openai import OpenAI
-import os
 
-# ====================== 頁面設定與自訂 CSS ======================
-st.set_page_config(
-    page_title="美股即時監控系統",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. 頁面配置與極致深色 CSS 注入
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="美股即時監控系統 PRO", layout="wide", initial_sidebar_state="expanded")
 
-# 極致深色高端金融風格 CSS (TradingView Pro + Bloomberg 暗黑模式)
-st.markdown("""
-<style>
-    /* 全域深色主題 */
-    .stApp { background-color: #0a0e17; color: #e0e4ed; }
-    .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-    
-    /* 卡片風格 */
-    .metric-card, .trend-card, .ai-panel, .alert-box {
-        background: linear-gradient(145deg, #1a2333, #121a29);
-        border-radius: 16px;
-        padding: 20px;
-        border: 1px solid #2a374f;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-        margin-bottom: 1.2rem;
-    }
-    .metric-card:hover { border-color: #3b82f6; transform: translateY(-2px); transition: all 0.3s; }
-    
-    /* 標題與分隔 */
-    h1, h2, h3 { color: #60a5fa; font-weight: 600; letter-spacing: -0.5px; }
-    .divider { border-top: 2px solid #334155; margin: 2rem 0; }
-    
-    /* Metric 美化 */
-    .stMetric { background: #1f2937; border-radius: 12px; padding: 12px; }
-    .stMetric label { color: #94a3b8; font-size: 0.9rem; }
-    .stMetric .stMetricValue { color: #e0e7ff; font-size: 1.8rem; font-weight: 700; }
-    .stMetric .stMetricDelta { font-size: 1rem; }
-    
-    /* AI 裁決大字 */
-    .verdict-bull { color: #22c55e; font-size: 3.2rem; font-weight: 800; text-shadow: 0 0 20px #22c55e; }
-    .verdict-bear { color: #ef4444; font-size: 3.2rem; font-weight: 800; text-shadow: 0 0 20px #ef4444; }
-    .verdict-neutral { color: #eab308; font-size: 3.2rem; font-weight: 800; }
-    
-    /* 信心度條 */
-    .confidence-bar {
-        height: 12px; border-radius: 9999px; background: linear-gradient(90deg, #22c55e, #eab308, #ef4444);
-        position: relative; overflow: hidden;
-    }
-    
-    /* 警示框 */
-    .alert-box { border-left: 6px solid #f59e0b; }
-    
-    /* VIX 壓力計 */
-    .vix-low { color: #22c55e; }
-    .vix-med { color: #eab308; }
-    .vix-high { color: #ef4444; }
-    
-    /* 按鈕美化 */
-    .stButton>button {
-        background: linear-gradient(90deg, #3b82f6, #1e40af);
-        color: white; border-radius: 12px; font-weight: 600;
-        border: none; padding: 0.6rem 1.8rem;
-    }
-    .stButton>button:hover { box-shadow: 0 0 15px #60a5fa; }
-</style>
-""", unsafe_allow_html=True)
+def apply_custom_style():
+    st.markdown("""
+    <style>
+        /* 全域深色背景 */
+        .stApp { background-color: #0e1117; color: #e0e0e0; }
+        
+        /* Metric 卡片自訂 */
+        [data-testid="stMetricValue"] { font-size: 1.8rem !important; font-weight: 700 !important; color: #00ffcc !important; }
+        div[data-testid="metric-container"] {
+            background-color: #1a1f2c;
+            border: 1px solid #2d343f;
+            padding: 15px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
 
-# ====================== Session State 初始化 ======================
-if 'alerts' not in st.session_state:
-    st.session_state.alerts = []
-if 'last_refresh' not in st.session_state:
-    st.session_state.last_refresh = time.time()
-if 'ai_cache' not in st.session_state:
-    st.session_state.ai_cache = {}
+        /* 趨勢卡片 */
+        .trend-card {
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 5px solid #00ffcc;
+            background: #161b22;
+            margin-bottom: 10px;
+        }
+        
+        /* AI 面板 */
+        .ai-panel {
+            background: linear-gradient(145deg, #1e1e2f, #11111d);
+            border: 1px solid #3d3d5c;
+            padding: 20px;
+            border-radius: 15px;
+            color: #ffffff;
+        }
+        
+        /* 狀態條 */
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 15px;
+            background: #252932;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin-bottom: 20px;
+        }
 
-# ====================== 輔助函數 ======================
+        /* 隱藏預設元件 */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+    </style>
+    """, unsafe_allow_html=True)
 
-@st.cache_data(ttl=30)  # 30秒快取即時數據
-def get_stock_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    """抓取 yfinance 數據並清理"""
+apply_custom_style()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. 核心數據處理函數
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60)
+def fetch_stock_data(symbol, interval='5m', period='5d'):
     try:
-        data = yf.download(ticker, interval=interval, period=period, auto_adjust=True, prepost=True)
-        if data.empty:
-            return pd.DataFrame()
-        data = data.dropna()
-        # 確保欄位存在
-        required = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required:
-            if col not in data.columns:
-                data[col] = np.nan
-        return data
-    except Exception as e:
-        st.error(f"{ticker} 數據抓取失敗: {e}")
-        return pd.DataFrame()
-
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """計算所有技術指標"""
-    if df.empty:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=interval)
+        if df.empty: return None
         return df
-    df = df.copy()
+    except:
+        return None
+
+def calculate_indicators(df):
+    # EMA 系列
+    for p in [5, 10, 20, 30, 40, 60, 120, 200]:
+        df[f'EMA{p}'] = ta.ema(df['Close'], length=p)
     
-    # 多條 EMA (彩色)
-    ema_periods = [5, 10, 20, 30, 40, 60, 120, 200]
-    colors = ['#22c55e', '#eab308', '#3b82f6', '#8b5cf6', '#ec4899', '#f97316', '#ef4444', '#64748b']
-    for i, p in enumerate(ema_periods):
-        df[f'EMA{p}'] = df['Close'].ewm(span=p, adjust=False).mean()
-        df[f'EMA{p}_color'] = colors[i % len(colors)]
-    
-    # 簡單 MA
-    df['MA5'] = df['Close'].rolling(5).mean()
-    df['MA15'] = df['Close'].rolling(15).mean()
+    # MA 系列
+    df['MA5'] = ta.sma(df['Close'], length=5)
+    df['MA15'] = ta.sma(df['Close'], length=15)
     
     # MACD
-    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    df['Hist'] = df['MACD'] - df['Signal']
+    macd = ta.macd(df['Close'])
+    df = pd.concat([df, macd], axis=1)
     
-    # Volume MA
-    df['Vol_MA5'] = df['Volume'].rolling(5).mean()
+    # Vol MA
+    df['VOL_MA5'] = ta.sma(df['Volume'], length=5)
     
-    # Pivot Points (基於最近完整日)
-    if len(df) > 1:
-        last_day = df.iloc[-1]
-        prev_day = df.iloc[-2] if len(df) > 1 else last_day
-        pp = (prev_day['High'] + prev_day['Low'] + prev_day['Close']) / 3
-        df['Pivot'] = pp
-        df['R1'] = 2 * pp - prev_day['Low']
-        df['S1'] = 2 * pp - prev_day['High']
-        df['R2'] = pp + (prev_day['High'] - prev_day['Low'])
-        df['S2'] = pp - (prev_day['High'] - prev_day['Low'])
-    
+    # Pivot Points (Simple)
+    df['Pivot'] = (df['High'].shift(1) + df['Low'].shift(1) + df['Close'].shift(1)) / 3
     return df
 
-def detect_signals(df: pd.DataFrame, tf: str, ticker: str) -> list:
-    """偵測多種警示條件，返回觸發列表"""
-    signals = []
-    if len(df) < 30:
-        return signals
-    
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    # MACD 金叉/死叉
-    if prev['MACD'] < prev['Signal'] and last['MACD'] > last['Signal']:
-        signals.append(f"📈 MACD 金叉 ({tf})")
-    if prev['MACD'] > prev['Signal'] and last['MACD'] < last['Signal']:
-        signals.append(f"📉 MACD 死叉 ({tf})")
-    
-    # EMA5 穿越 EMA20
-    if 'EMA5' in df.columns and 'EMA20' in df.columns:
-        if prev['EMA5'] < prev['EMA20'] and last['EMA5'] > last['EMA20']:
-            signals.append(f"🚀 EMA5 上穿 EMA20 ({tf})")
-        if prev['EMA5'] > prev['EMA20'] and last['EMA5'] < last['EMA20']:
-            signals.append(f"⚠️ EMA5 下穿 EMA20 ({tf})")
-    
-    # 全 EMA 多頭排列 (5>10>20>30>60)
-    emas = [5,10,20,30,60]
-    if all(f'EMA{p}' in df.columns for p in emas):
-        bull_arrange = all(last[f'EMA{emas[i]}'] > last[f'EMA{emas[i+1]}'] for i in range(len(emas)-1))
-        if bull_arrange and not all(prev[f'EMA{emas[i]}'] > prev[f'EMA{emas[i+1]}'] for i in range(len(emas)-1)):
-            signals.append(f"🌟 全 EMA 多頭排列 ({tf})")
-    
-    # 成交量暴增 >2x Vol_MA5
-    if last['Volume'] > 2 * last['Vol_MA5']:
-        signals.append(f"🔥 成交量暴增 {last['Volume']/1e6:.1f}M ({tf})")
-    
-    # 價格突破/跌破 Pivot
-    if last['Close'] > last['R1'] and prev['Close'] <= prev['R1']:
-        signals.append(f"🔺 突破 R1 阻力 ({tf})")
-    if last['Close'] < last['S1'] and prev['Close'] >= prev['S1']:
-        signals.append(f"🔻 跌破 S1 支撐 ({tf})")
-    
-    return signals
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. 警示與通知系統
+# ══════════════════════════════════════════════════════════════════════════════
 
-def send_telegram(token: str, chat_id: str, msg: str):
-    """發送 Telegram 警示"""
-    if not token or not chat_id:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
-    except:
-        pass
+if 'alerts' not in st.session_state:
+    st.session_state.alerts = []
 
-def plot_professional_chart(df: pd.DataFrame, ticker: str, tf: str, max_bars: int = 90) -> go.Figure:
-    """極致專業 Plotly K線圖 (3子圖 + 多EMA + 支撐阻力 + Volume spike + MACD 金叉標註)"""
-    df = df.tail(max_bars).copy()
-    if df.empty:
-        fig = go.Figure()
-        fig.add_annotation(text="無數據", showarrow=False, font_size=30)
-        return fig
+def send_telegram(message):
+    token = st.secrets.get("TELEGRAM_BOT_TOKEN")
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
+    if token and chat_id:
+        url = f"https://api.telegram.org/bot{token}/sendMessage?chat_id={chat_id}&text={message}"
+        requests.get(url)
+
+def check_alerts(symbol, df):
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2]
     
-    # 主圖 + Volume + MACD
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.55, 0.20, 0.25],
-        subplot_titles=(f"{ticker} {tf} K線圖", "成交量 + Vol MA5", "MACD + Signal")
-    )
+    msg = ""
+    # MACD 金叉
+    if prev_row['MACDh_12_26_9'] < 0 and last_row['MACDh_12_26_9'] > 0:
+        msg = f"🚀 {symbol} MACD 金叉 (Bullish Cross)"
+    # EMA 穿越
+    if prev_row['EMA5'] < prev_row['EMA20'] and last_row['EMA5'] > last_row['EMA20']:
+        msg = f"🔥 {symbol} EMA5 向上穿越 EMA20"
+    # 成交量暴增
+    if last_row['Volume'] > last_row['VOL_MA5'] * 2.5:
+        msg = f"📊 {symbol} 成交量異常放量 (>2.5x)"
+
+    if msg:
+        alert_entry = {"time": datetime.now().strftime("%H:%M:%S"), "symbol": symbol, "msg": msg}
+        st.session_state.alerts.insert(0, alert_entry)
+        send_telegram(f"【美股監控】{symbol}: {msg}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. 側邊欄配置
+# ══════════════════════════════════════════════════════════════════════════════
+
+with st.sidebar:
+    st.header("⚙️ 控制面板")
+    input_symbols = st.text_area("監控清單 (逗號分隔)", "AAPL, TSLA, NVDA, MSFT").upper()
+    symbols = [s.strip() for s in input_symbols.split(",")]
     
-    # 1. K線 + EMA + MA + Pivot
+    mode = st.radio("監控模式", ["單一週期詳細", "多週期 MTF 監控"])
+    
+    intervals = ['1m', '5m', '15m', '30m', '1d', '1wk', '1mo']
+    if mode == "單一週期詳細":
+        selected_interval = st.selectbox("選擇週期", intervals, index=1)
+    else:
+        mtf_intervals = st.multiselect("選擇 MTF 週期", intervals, default=['5m', '15m', '1d'])
+        col_layout = st.selectbox("圖表排列", ["並排2欄", "堆疊全寬"])
+
+    st.markdown("---")
+    refresh_auto = st.toggle("自動刷新", value=False)
+    refresh_sec = st.slider("刷新秒數", 10, 300, 60)
+    max_bars = st.number_input("K線顯示根數", 30, 300, 90)
+    
+    st.markdown("---")
+    show_market = st.checkbox("市場環境面板", True)
+    show_ai = st.checkbox("AI 技術分析", True)
+    
+    if st.button("🗑️ 清除警示記錄"):
+        st.session_state.alerts = []
+    
+    if st.session_state.alerts:
+        df_alerts = pd.DataFrame(st.session_state.alerts)
+        st.download_button("📥 匯出警示 CSV", df_alerts.to_csv(index=False), "alerts.csv")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. 市場環境總覽 (Top Panel)
+# ══════════════════════════════════════════════════════════════════════════════
+
+if show_market:
+    st.markdown("### 🌍 市場環境總覽")
+    m_cols = st.columns(6)
+    indices = {"SPY": "標普500", "QQQ": "納指100", "^VIX": "波動率", "GLD": "黃金", "UUP": "美元", "^TNX": "10Y債息"}
+    
+    for i, (sym, name) in enumerate(indices.items()):
+        m_data = fetch_stock_data(sym, '5m', '2d')
+        if m_data is not None:
+            price = m_data['Close'].iloc[-1]
+            change = m_data['Close'].iloc[-1] - m_data['Close'].iloc[-2]
+            pct = (change / m_data['Close'].iloc[-2]) * 100
+            color = "normal" if sym != "^VIX" else "inverse"
+            m_cols[i].metric(name, f"{price:.2f}", f"{pct:+.2f}%", delta_color=color)
+
+    # VIX 壓力計與情緒
+    vix_val = fetch_stock_data("^VIX", '1d', '5d')['Close'].iloc[-1]
+    sentiment_score = max(0, min(100, 100 - (vix_val * 2))) # 簡易邏輯
+    
+    st.markdown(f"""
+    <div class="status-bar">
+        <span>🔥 恐慌指數 VIX: <b>{vix_val:.2f}</b></span>
+        <span>🧠 投資人情緒得分: <b>{sentiment_score:.0f}/100</b> ({'貪婪' if sentiment_score > 60 else '恐懼' if sentiment_score < 40 else '中性'})</span>
+        <span>🕒 最後更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. 專業圖表引擎 (Plotly)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def create_pro_chart(df, symbol, interval):
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, row_heights=[0.7, 0.3])
+
+    # K線
     fig.add_trace(go.Candlestick(
-        x=df.index, open=df['Open'], high=df['High'],
-        low=df['Low'], close=df['Close'], name="OHLC",
-        increasing_line_color='#22c55e', decreasing_line_color='#ef4444'
+        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        name="K線", increasing_line_color='#00ffbb', decreasing_line_color='#ff3355'
     ), row=1, col=1)
-    
-    # 多條 EMA
-    ema_periods = [5,10,20,30,40,60,120,200]
-    colors = ['#22c55e','#eab308','#3b82f6','#8b5cf6','#ec4899','#f97316','#ef4444','#64748b']
-    for i, p in enumerate(ema_periods):
-        col_name = f'EMA{p}'
-        if col_name in df.columns:
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df[col_name],
-                mode='lines', name=f'EMA{p}',
-                line=dict(color=colors[i], width=1.8 if p in [5,20] else 1.2)
-            ), row=1, col=1)
-    
-    # MA5 / MA15
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA5'], mode='lines', name='MA5', line=dict(color='#a5b4fc', dash='dot')), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['MA15'], mode='lines', name='MA15', line=dict(color='#c4d0ff', dash='dot')), row=1, col=1)
-    
-    # 動態 Pivot 線 (僅顯示最近合理範圍)
-    if 'Pivot' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index[-30:], y=df['Pivot'][-30:], mode='lines', name='Pivot', line=dict(color='#facc15', dash='dash', width=1.5)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index[-30:], y=df['R1'][-30:], mode='lines', name='R1', line=dict(color='#f87171', dash='dot')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index[-30:], y=df['S1'][-30:], mode='lines', name='S1', line=dict(color='#60a5fa', dash='dot')), row=1, col=1)
-    
-    # 最高最低價自動標註
-    high_idx = df['High'].idxmax()
-    low_idx = df['Low'].idxmin()
-    fig.add_annotation(x=high_idx, y=df['High'].max(), text=f"高 {df['High'].max():.2f}", showarrow=True, arrowhead=2, arrowcolor="#22c55e", font=dict(color="#22c55e"))
-    fig.add_annotation(x=low_idx, y=df['Low'].min(), text=f"低 {df['Low'].min():.2f}", showarrow=True, arrowhead=2, arrowcolor="#ef4444", font=dict(color="#ef4444"))
-    
-    # 2. 成交量柱狀 + Vol MA5 + 異常放量鑽石標記
-    colors_vol = ['#22c55e' if c > o else '#ef4444' for c, o in zip(df['Close'], df['Open'])]
-    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Volume', marker_color=colors_vol, opacity=0.75), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['Vol_MA5'], mode='lines', name='Vol MA5', line=dict(color='#94a3b8', width=2)), row=2, col=1)
-    
+
+    # EMA 繪製
+    ema_colors = {5: '#ffffff', 20: '#ff9900', 60: '#00ccff', 200: '#ff00ff'}
+    for p, color in ema_colors.items():
+        fig.add_trace(go.Scatter(x=df.index, y=df[f'EMA{p}'], line=dict(color=color, width=1), name=f'EMA{p}'), row=1, col=1)
+
+    # 成交量
+    colors = ['#00ffbb' if c >= o else '#ff3355' for c, o in zip(df['Close'], df['Open'])]
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name="成交量", opacity=0.5), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['VOL_MA5'], line=dict(color='#ffcc00', width=1), name="VOL MA5"), row=2, col=1)
+
     # 異常放量標記
-    vol_spike = df[df['Volume'] > 2 * df['Vol_MA5']]
-    if not vol_spike.empty:
-        fig.add_trace(go.Scatter(
-            x=vol_spike.index, y=vol_spike['Volume']*1.05,
-            mode='markers', name='放量',
-            marker=dict(symbol='diamond', size=12, color='#eab308', line=dict(width=2, color='white'))
-        ), row=2, col=1)
-    
-    # 3. MACD 子圖 + 金叉/死叉智能標註
-    fig.add_trace(go.Scatter(x=df.index, y=df['MACD'], mode='lines', name='MACD', line=dict(color='#22c55e')), row=3, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df['Signal'], mode='lines', name='Signal', line=dict(color='#ef4444')), row=3, col=1)
-    fig.add_trace(go.Bar(x=df.index, y=df['Hist'], name='Hist', marker_color=np.where(df['Hist']>0, '#22c55e', '#ef4444')), row=3, col=1)
-    
-    # 智能 MACD 交叉標註 (避免過度擁擠，只標最近 5 次)
-    crosses = []
-    for i in range(1, len(df)):
-        if df.iloc[i-1]['MACD'] < df.iloc[i-1]['Signal'] and df.iloc[i]['MACD'] > df.iloc[i]['Signal']:
-            crosses.append((df.index[i], "金叉", "#22c55e"))
-        elif df.iloc[i-1]['MACD'] > df.iloc[i-1]['Signal'] and df.iloc[i]['MACD'] < df.iloc[i]['Signal']:
-            crosses.append((df.index[i], "死叉", "#ef4444"))
-    for idx, text, color in crosses[-5:]:
-        fig.add_annotation(x=idx, y=df.loc[idx, 'MACD'], text=text, showarrow=True, arrowhead=1, arrowcolor=color, font=dict(color=color, size=11), row=3, col=1)
-    
-    # 美化佈局
+    spike = df[df['Volume'] > df['VOL_MA5'] * 2]
+    fig.add_trace(go.Scatter(x=spike.index, y=spike['Low'] * 0.998, mode='markers', 
+                             marker=dict(symbol='diamond', size=8, color='#ffff00'), name="異常放量"), row=1, col=1)
+
     fig.update_layout(
-        height=820,
-        title=f"{ticker} {tf} 專業技術圖表 - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        template="plotly_dark",
-        paper_bgcolor="#0a0e17",
-        plot_bgcolor="#111827",
-        font=dict(color="#e0e7ff"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, bgcolor="#1f2937"),
-        margin=dict(l=50, r=50, t=80, b=50),
+        height=600, template="plotly_dark",
+        margin=dict(l=10, r=10, t=30, b=10),
         xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-    fig.update_xaxes(gridcolor="#334155", zerolinecolor="#334155")
-    fig.update_yaxes(gridcolor="#334155", zerolinecolor="#334155")
-    
     return fig
 
-def get_market_indices() -> dict:
-    """抓取大盤指數卡片數據"""
-    indices = ["SPY", "QQQ", "DIA", "GLD", "UUP", "^TNX"]
-    result = {}
-    for idx in indices:
-        df = get_stock_data(idx, "1d", "5d")
-        if not df.empty:
-            price = round(df['Close'].iloc[-1], 2)
-            change_pct = round((price - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100, 2)
-            result[idx] = {"price": price, "change": change_pct}
-    return result
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. AI 分析模組
+# ══════════════════════════════════════════════════════════════════════════════
 
-def get_vix_data():
-    """VIX 數據"""
-    df = get_stock_data("^VIX", "1d", "30d")
-    if df.empty:
-        return 20.0, pd.DataFrame()
-    return round(df['Close'].iloc[-1], 1), df.tail(10)
-
-def get_news() -> list:
-    """即時財經新聞 + bull/bear 標記"""
-    feeds = [
-        "https://feeds.content.dowjones.io/public/rss/mw_topstories",
-        "https://news.google.com/rss/search?q=US+stock+market+OR+wall+street+OR+earnings&hl=en-US&gl=US&ceid=US:en"
-    ]
-    news_list = []
-    for url in feeds:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:8]:
-                title = entry.title
-                link = entry.link
-                # 簡單情緒判斷
-                lower = title.lower()
-                if any(w in lower for w in ['rise', 'gain', 'surge', 'bull', 'up', 'beat', 'rally']):
-                    sentiment = "🟢 Bull"
-                elif any(w in lower for w in ['fall', 'drop', 'plunge', 'bear', 'down', 'miss', 'crash']):
-                    sentiment = "🔴 Bear"
-                else:
-                    sentiment = "⚪ Neutral"
-                news_list.append({"title": title[:90] + "..." if len(title)>90 else title, "link": link, "sent": sentiment})
-        except:
-            continue
-    return news_list[:10]
-
-def get_sentiment_index(vix: float, spy_change: float) -> int:
-    """投資人情緒指數 (0-100)"""
-    score = 50 + (25 - vix) * 1.8 + spy_change * 1.5
-    return max(0, min(100, int(score)))
-
-# ====================== AI 技術分析核心 ======================
-def generate_ai_analysis(provider: str, api_key: str, ticker: str, tf_data: dict, market_env: dict) -> dict:
-    """打包所有指標給 LLM，返回嚴格 JSON"""
-    cache_key = f"{ticker}_{provider}"
-    if cache_key in st.session_state.ai_cache:
-        return st.session_state.ai_cache[cache_key]
+def run_ai_analysis(symbol, df, market_context):
+    api_key = st.secrets.get("GROQ_API_KEY")
+    if not api_key:
+        st.error("請在 st.secrets 中配置 GROQ_API_KEY")
+        return None
     
-    # 整理 prompt 數據
-    summary = []
-    for tf, df in tf_data.items():
-        if df.empty: continue
-        last = df.iloc[-1]
-        summary.append(f"{tf}: 收盤 {last['Close']:.2f} | 漲跌 {((last['Close']/df.iloc[-2]['Close']-1)*100):+.2f}% | "
-                       f"MACD {last['MACD']:+.3f} | EMA5 {last.get('EMA5',0):.2f} EMA20 {last.get('EMA20',0):.2f}")
+    client = Groq(api_key=api_key)
+    last = df.iloc[-1]
     
-    prompt = f"""你是一位頂級美股量化交易員與技術分析師。請對 {ticker} 進行嚴格專業分析。
-當前市場環境: VIX={market_env['vix']}, 情緒指數={market_env['sentiment']}, SPY 1日變動={market_env.get('spy_change',0):+.2f}%
-
-技術摘要:
-{" | ".join(summary)}
-
-請以繁體中文嚴格回傳以下 JSON 格式 (不要多餘文字，不要 markdown):
-{{
-  "verdict": "做多" | "做空" | "觀望",
-  "confidence": 0-100,
-  "trend_analysis": "簡短趨勢描述",
-  "entry_price": 數字,
-  "entry_note": "進場理由",
-  "take_profit_1": 數字,
-  "take_profit_2": 數字,
-  "stop_loss": 數字,
-  "risk_reward": "1:2.5",
-  "key_risks": "主要風險點",
-  "reasoning": "詳細繁體中文推理邏輯 (300字以內)"
-}}
-"""
+    prompt = f"""
+    你是專業美股分析師。請分析 {symbol}。
+    當前數據：價格={last['Close']:.2f}, EMA20={last['EMA20']:.2f}, EMA60={last['EMA60']:.2f}, MACD={last['MACDh_12_26_9']:.4f}。
+    市場背景：VIX={market_context['vix']:.2f}。
+    
+    請嚴格以 JSON 格式回傳：
+    {{
+      "verdict": "做多/做空/觀望",
+      "confidence": 0-100,
+      "trend_analysis": "...",
+      "entry_price": 0.0,
+      "take_profit_1": 0.0,
+      "stop_loss": 0.0,
+      "reasoning": "繁體中文詳細理由"
+    }}
+    """
+    
     try:
-        if provider == "Groq (LLaMA 3.3)":
-            client = Groq(api_key=api_key)
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=800,
-                response_format={"type": "json_object"}
-            )
-            result = json.loads(response.choices[0].message.content)
-        else:  # Grok
-            client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
-            response = client.chat.completions.create(
-                model="grok-4",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=800,
-                response_format={"type": "json_object"}
-            )
-            result = json.loads(response.choices[0].message.content)
-        
-        st.session_state.ai_cache[cache_key] = result
-        return result
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        return json.loads(completion.choices[0].message.content)
     except Exception as e:
-        st.error(f"AI 分析失敗: {e}")
-        return {"verdict": "觀望", "confidence": 50, "trend_analysis": "API 錯誤", "reasoning": str(e)}
+        return {"error": str(e)}
 
-# ====================== 主程式 ======================
-def main():
-    st.title("📈 美股即時監控系統")
-    st.caption("專業級深色儀表板 • 即時數據 • AI 決策 • Telegram 警示")
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. 主程式渲染
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ====================== 側邊欄 ======================
-    with st.sidebar:
-        st.header("⚙️ 系統設定")
-        stocks_input = st.text_area("股票代號 (逗號分隔)", value="AAPL, TSLA, NVDA, MSFT, AMZN", height=100)
-        stocks = [s.strip().upper() for s in stocks_input.split(",") if s.strip()]
-        
-        mode = st.radio("📊 監控模式", ["單一週期", "多週期同時監控 (MTF)"], horizontal=True)
-        
-        if mode == "單一週期":
-            timeframe = st.selectbox("時間週期", ["1m", "5m", "15m", "30m", "1d", "1wk", "1mo"], index=4)
-            selected_tfs = [timeframe]
-        else:
-            selected_tfs = st.multiselect("選擇多個時間框架", ["1m", "5m", "15m", "30m", "1d", "1wk", "1mo"], default=["1d", "1wk"])
-            layout_mode = st.radio("圖表排列方式", ["並排2欄", "堆疊全寬"])
-        
-        auto_refresh = st.toggle("自動刷新", value=True)
-        refresh_sec = st.slider("刷新間隔 (秒)", 15, 300, 45, disabled=not auto_refresh)
-        max_bars = st.slider("K線最大顯示根數", 30, 500, 90)
-        
-        st.divider()
-        show_market_panel = st.toggle("🌍 市場環境總覽", value=True)
-        show_alerts_detect = st.toggle("🚨 警示偵測", value=True)
-        show_ai_panel = st.toggle("🤖 AI 技術分析", value=True)
-        
-        st.divider()
-        ai_provider = st.selectbox("AI 供應商", ["Groq (LLaMA 3.3)", "Grok (xAI)"])
-        ai_key = st.text_input("API Key (或使用 .streamlit/secrets.toml)", type="password", value=os.getenv("GROQ_API_KEY") or "")
-        
-        telegram_on = st.toggle("📲 Telegram 警示通知")
-        if telegram_on:
-            tg_token = st.text_input("BOT_TOKEN", type="password", value=os.getenv("TG_BOT_TOKEN") or "")
-            tg_chat = st.text_input("CHAT_ID", value=os.getenv("TG_CHAT_ID") or "")
-        
-        if st.button("🗑️ 清除所有警示記錄"):
-            st.session_state.alerts = []
-            st.success("已清除")
-        
-        if st.button("📥 匯出警示 CSV"):
-            if st.session_state.alerts:
-                df_alert = pd.DataFrame(st.session_state.alerts)
-                csv = df_alert.to_csv(index=False).encode()
-                st.download_button("下載 CSV", csv, f"alerts_{datetime.now().strftime('%Y%m%d')}.csv", "text/csv")
-    
-    # ====================== 自動刷新邏輯 ======================
-    if auto_refresh and time.time() - st.session_state.last_refresh > refresh_sec:
-        st.session_state.last_refresh = time.time()
-        st.rerun()
+tabs = st.tabs([f"📈 {s}" for s in symbols] + ["🔔 警示中心"])
 
-    # ====================== 置頂市場環境總覽 ======================
-    if show_market_panel:
-        st.subheader("🌍 市場環境總覽")
-        idx_data = get_market_indices()
-        cols = st.columns(6)
-        for i, (sym, val) in enumerate(idx_data.items()):
-            with cols[i]:
-                delta_color = "normal" if val['change'] >= 0 else "inverse"
-                st.metric(sym, f"{val['price']:.2f}", f"{val['change']:+.2f}%", delta_color=delta_color)
-        
-        # VIX + 情緒
-        vix_val, vix_df = get_vix_data()
-        col_vix1, col_vix2, col_sent = st.columns([2, 3, 2])
-        with col_vix1:
-            st.metric("VIX 恐慌指數", f"{vix_val:.1f}", delta=None)
-        with col_vix2:
-            fig_gauge = go.Figure(go.Indicator(
-                mode="gauge+number",
-                value=vix_val,
-                title={"text": "VIX 壓力計"},
-                gauge={
-                    "axis": {"range": [0, 50]},
-                    "bar": {"color": "#64748b"},
-                    "steps": [
-                        {"range": [0, 15], "color": "#22c55e"},
-                        {"range": [15, 25], "color": "#eab308"},
-                        {"range": [25, 50], "color": "#ef4444"}
-                    ],
-                    "threshold": {"line": {"color": "white", "width": 4}, "value": vix_val}
-                }
-            ))
-            fig_gauge.update_layout(height=180, margin=dict(l=20,r=20,t=30,b=10))
-            st.plotly_chart(fig_gauge, use_container_width=True)
-        
-        with col_sent:
-            spy_chg = idx_data.get("SPY", {}).get("change", 0)
-            sentiment = get_sentiment_index(vix_val, spy_chg)
-            color = "#22c55e" if sentiment > 65 else "#eab308" if sentiment > 40 else "#ef4444"
-            st.metric("投資人情緒指數", f"{sentiment}", delta=None)
-            st.progress(sentiment / 100, text=f"情緒 {sentiment}/100")
-        
-        # 新聞
-        st.subheader("📰 即時財經新聞")
-        news_items = get_news()
-        news_cols = st.columns(2)
-        for i, item in enumerate(news_items[:6]):
-            with news_cols[i % 2]:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <small style="color:#94a3b8">{item['sent']}</small><br>
-                    <a href="{item['link']}" target="_blank" style="color:#e0e7ff; text-decoration:none;">{item['title']}</a>
-                </div>
-                """, unsafe_allow_html=True)
-    
-    st.divider()
-    
-    # ====================== 個股分析 Tab ======================
-    if not stocks:
-        st.warning("請在側邊欄輸入股票代號")
-        st.stop()
-    
-    tabs = st.tabs(stocks)
-    for tab_idx, ticker in enumerate(stocks):
-        with tabs[tab_idx]:
-            st.header(f"🔍 {ticker} 即時分析")
-            
-            # 抓取所有選定時間框架數據
-            tf_data = {}
-            period_map = {"1m": "7d", "5m": "30d", "15m": "30d", "30m": "60d", "1d": "1y", "1wk": "2y", "1mo": "5y"}
-            for tf in selected_tfs:
-                interval = tf
-                period = period_map.get(tf, "60d")
-                raw_df = get_stock_data(ticker, interval, period)
-                if not raw_df.empty:
-                    df = calculate_indicators(raw_df)
-                    tf_data[tf] = df.tail(max_bars)
-            
-            # 總覽摘要列 (每週期一卡片)
-            if tf_data:
-                sum_cols = st.columns(len(tf_data))
-                for i, (tf, df) in enumerate(tf_data.items()):
-                    if df.empty: continue
-                    last = df.iloc[-1]
-                    chg = (last['Close'] / df.iloc[-2]['Close'] - 1) * 100 if len(df)>1 else 0
-                    with sum_cols[i]:
-                        st.metric(
-                            f"{tf} 收盤",
-                            f"{last['Close']:.2f}",
-                            f"{chg:+.2f}%",
-                            delta_color="normal" if chg >= 0 else "inverse"
-                        )
-                        st.caption(f"H {last['High']:.2f} / L {last['Low']:.2f} | Vol {last['Volume']/1e6:.1f}M")
-            
-            # 警示
-            if show_alerts_detect:
-                all_signals = []
-                for tf, df in tf_data.items():
-                    sigs = detect_signals(df, tf, ticker)
-                    all_signals.extend(sigs)
-                    for sig in sigs:
-                        if sig not in [a['msg'] for a in st.session_state.alerts if a['ticker']==ticker]:
-                            alert_entry = {"time": datetime.now().strftime("%H:%M:%S"), "ticker": ticker, "msg": sig, "tf": tf}
-                            st.session_state.alerts.append(alert_entry)
-                            if telegram_on and 'tg_token' in locals() and 'tg_chat' in locals():
-                                send_telegram(tg_token, tg_chat, f"🚨 {ticker} {sig}")
+for i, symbol in enumerate(symbols):
+    with tabs[i]:
+        if mode == "單一週期詳細":
+            df = fetch_stock_data(symbol, selected_interval)
+            if df is not None:
+                df = calculate_indicators(df)
+                check_alerts(symbol, df)
                 
-                if all_signals:
-                    st.subheader("🚨 即時警示")
-                    for s in all_signals[-5:]:
-                        st.error(s)
+                # 頂部個股快速數據
+                c1, c2, c3, c4 = st.columns(4)
+                last_p = df['Close'].iloc[-1]
+                change_p = last_p - df['Close'].iloc[-2]
+                c1.metric(symbol, f"${last_p:.2f}", f"{change_p:+.2f}")
+                
+                # 趨勢判斷
+                trend = "多頭" if last_p > df['EMA60'].iloc[-1] else "空頭"
+                c2.markdown(f'<div class="trend-card">趨勢: <b>{trend}</b></div>', unsafe_allow_html=True)
+                
+                # 圖表
+                st.plotly_chart(create_pro_chart(df.tail(max_bars), symbol, selected_interval), use_container_width=True)
+                
+                # AI 分析區
+                if show_ai:
+                    if st.button(f"🤖 執行 AI 深度分析 ({symbol})", key=f"ai_{symbol}"):
+                        with st.spinner("AI 正在分析大數據與技術指標..."):
+                            ctx = {"vix": vix_val}
+                            result = run_ai_analysis(symbol, df, ctx)
+                            if result and "verdict" in result:
+                                st.markdown(f"""
+                                <div class="ai-panel">
+                                    <h3>🤖 AI 交易決策：{result['verdict']} (信心度: {result['confidence']}%)</h3>
+                                    <hr>
+                                    <p><b>分析邏輯：</b>{result['reasoning']}</p>
+                                    <div style="display: flex; gap: 20px;">
+                                        <div style="background:#2e7d32; padding:10px; border-radius:5px;">進場: {result['entry_price']}</div>
+                                        <div style="background:#c62828; padding:10px; border-radius:5px;">止損: {result['stop_loss']}</div>
+                                        <div style="background:#1565c0; padding:10px; border-radius:5px;">止盈: {result['take_profit_1']}</div>
+                                    </div>
+                                </div>
+                                """, unsafe_allow_html=True)
+        
+        else: # MTF 多週期模式
+            st.subheader(f"多週期同步監控 - {symbol}")
+            rows = st.columns(2) if col_layout == "並排2欄" else [st.container()]
             
-            # K線圖
-            st.subheader("📊 多週期 K線圖")
-            if mode == "多週期同時監控 (MTF)":
-                if layout_mode == "並排2欄":
-                    chart_cols = st.columns(2)
-                    for i, (tf, df) in enumerate(tf_data.items()):
-                        with chart_cols[i % 2]:
-                            fig = plot_professional_chart(df, ticker, tf, max_bars)
-                            st.plotly_chart(fig, use_container_width=True, key=f"mtf_{ticker}_{tf}")
-                else:
-                    for tf, df in tf_data.items():
-                        fig = plot_professional_chart(df, ticker, tf, max_bars)
-                        st.plotly_chart(fig, use_container_width=True, key=f"stack_{ticker}_{tf}")
-            else:
-                # 單一模式詳細圖
-                if selected_tfs:
-                    tf = selected_tfs[0]
-                    df = tf_data.get(tf)
-                    if df is not None:
-                        fig = plot_professional_chart(df, ticker, tf, max_bars)
-                        st.plotly_chart(fig, use_container_width=True)
-            
-            # AI 技術分析面板
-            if show_ai_panel and ai_key and tf_data:
-                st.subheader("🤖 AI 專業技術分析報告")
-                if st.button(f"🚀 執行 {ticker} AI 分析", type="primary"):
-                    with st.spinner("AI 正在深度分析市場結構與多週期共振..."):
-                        market_env = {
-                            "vix": get_vix_data()[0],
-                            "sentiment": get_sentiment_index(get_vix_data()[0], idx_data.get("SPY", {}).get("change", 0)),
-                            "spy_change": idx_data.get("SPY", {}).get("change", 0)
-                        }
-                        ai_result = generate_ai_analysis(ai_provider, ai_key, ticker, tf_data, market_env)
-                        
-                        # 美觀渲染
-                        verdict = ai_result.get("verdict", "觀望")
-                        conf = ai_result.get("confidence", 50)
-                        col_a, col_b = st.columns([3, 2])
-                        with col_a:
-                            if verdict == "做多":
-                                st.markdown(f'<div class="verdict-bull">✅ {verdict}</div>', unsafe_allow_html=True)
-                            elif verdict == "做空":
-                                st.markdown(f'<div class="verdict-bear">❌ {verdict}</div>', unsafe_allow_html=True)
-                            else:
-                                st.markdown(f'<div class="verdict-neutral">⏸️ {verdict}</div>', unsafe_allow_html=True)
-                            
-                            st.markdown(f"**信心度** {conf}%")
-                            st.progress(conf / 100)
-                        
-                        with col_b:
-                            st.metric("建議進場價", f"{ai_result.get('entry_price',0):.2f}", help=ai_result.get('entry_note',''))
-                            st.metric("停損", f"{ai_result.get('stop_loss',0):.2f}")
-                            st.metric("TP1 / TP2", f"{ai_result.get('take_profit_1',0):.2f} / {ai_result.get('take_profit_2',0):.2f}")
-                            st.caption(f"RR 比: {ai_result.get('risk_reward','')}")
-                        
-                        st.markdown("#### 📝 詳細推理")
-                        st.info(ai_result.get("reasoning", "無"))
-                        
-                        st.markdown("#### ⚠️ 關鍵風險")
-                        st.warning(ai_result.get("key_risks", "無"))
-            
-            st.caption(f"最後更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            for idx, m_int in enumerate(mtf_intervals):
+                m_df = fetch_stock_data(symbol, m_int)
+                if m_df is not None:
+                    m_df = calculate_indicators(m_df)
+                    target_col = rows[idx % 2] if col_layout == "並排2欄" else st
+                    with target_col:
+                        st.markdown(f"#### ⏱️ 週期: {m_int}")
+                        st.plotly_chart(create_pro_chart(m_df.tail(max_bars), symbol, m_int), use_container_width=True)
 
-if __name__ == "__main__":
-    main()
+# 警示中心分頁
+with tabs[-1]:
+    st.header("🔔 即時警示串流")
+    if not st.session_state.alerts:
+        st.info("目前尚無觸發警示")
+    else:
+        for a in st.session_state.alerts:
+            st.warning(f"[{a['time']}] **{a['symbol']}**: {a['msg']}")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. 自動刷新邏輯
+# ══════════════════════════════════════════════════════════════════════════════
+if refresh_auto:
+    time.sleep(refresh_sec)
+    st.rerun()
+
+# 頁尾資訊
+st.markdown("---")
+st.caption("PRO System v2.0 | Data by yfinance | AI by Groq LLaMA 3.3")
