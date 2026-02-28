@@ -747,92 +747,150 @@ def fetch_stocktwits(symbol: str) -> dict:
 
 @st.cache_data(ttl=300)
 def fetch_reddit_sentiment(symbol: str) -> dict:
-    import html as html_lib
+    """
+    Reddit sentiment via multiple fallback methods:
+    1. Subreddit RSS feeds (no auth, hardest to block)
+    2. Reddit JSON API search
+    3. Global Reddit RSS search
+    """
+    import html as html_lib, re
     from datetime import timezone
     posts = []
     bull = bear = 0
-    sym_lower = symbol.lower()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    sym_up  = symbol.upper()
+    sym_low = symbol.lower()
+
+    # RSS User-Agent — RSS bots are rarely blocked
+    rss_headers = {"User-Agent": "RSS-Reader/2.0 (compatible)"}
+    api_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
         "Accept": "application/json",
     }
 
-    def _make_post(d, sub):
-        title = html_lib.unescape(d.get("title", "")).strip()
-        if not title:
-            return None
-        ts  = d.get("created_utc", 0)
-        tstr = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
-        return {"title": title, "sentiment": _classify(title),
-                "score": d.get("score", 0), "comments": d.get("num_comments", 0),
-                "url": "https://reddit.com" + d.get("permalink", ""),
-                "sub": sub, "time": tstr}
-
-    def _sym_in(text):
+    def _sym_in(text: str) -> bool:
         t = text.lower()
-        return (sym_lower in t or
-                "$" + sym_lower in t or
-                sym_lower.upper() in text)
+        return (f"${sym_low}" in t or f" {sym_low} " in t or
+                f"({sym_up})" in text or f" {sym_up} " in text or
+                t.startswith(sym_low))
 
-    # ── Try 1: subreddit search (most relevant) ──────────────────────────
-    for sub in ["wallstreetbets", "stocks", "investing", "StockMarket"]:
+    def _ts_to_str(ts) -> str:
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%m/%d %H:%M")
+        except Exception:
+            return ""
+
+    # ── Strategy 1: Subreddit RSS (most reliable, rarely blocked) ────────
+    rss_feeds = [
+        ("wallstreetbets", f"https://www.reddit.com/r/wallstreetbets/search.rss?q={sym_up}&sort=new&restrict_sr=1"),
+        ("stocks",         f"https://www.reddit.com/r/stocks/search.rss?q={sym_up}&sort=new&restrict_sr=1"),
+        ("investing",      f"https://www.reddit.com/r/investing/search.rss?q={sym_up}&sort=new&restrict_sr=1"),
+        ("StockMarket",    f"https://www.reddit.com/r/StockMarket/search.rss?q={sym_up}&sort=new&restrict_sr=1"),
+    ]
+    for sub, feed_url in rss_feeds:
         if len(posts) >= 10:
             break
-        for sort in ["new", "hot"]:
-            try:
-                url  = ("https://www.reddit.com/r/" + sub + "/search.json"
-                        "?q=" + symbol + "&sort=" + sort + "&limit=25&restrict_sr=1")
-                resp = requests.get(url, timeout=10, headers=headers)
-                if resp.status_code != 200:
-                    continue
-                for item in resp.json().get("data", {}).get("children", []):
-                    p = _make_post(item.get("data", {}), sub)
-                    if p:
-                        posts.append(p)
-                        if p["sentiment"] == "bull": bull += 1
-                        elif p["sentiment"] == "bear": bear += 1
-                if posts:
-                    break
-            except Exception:
+        try:
+            resp = requests.get(feed_url, timeout=10, headers=rss_headers)
+            if resp.status_code != 200:
                 continue
+            # Parse RSS/Atom entries
+            entries = re.findall(r"<entry>(.*?)</entry>", resp.text, re.DOTALL)
+            if not entries:
+                entries = re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL)
+            for entry in entries:
+                # Title
+                t_m = re.search(r"<title[^>]*>(.*?)</title>", entry, re.DOTALL)
+                if not t_m:
+                    continue
+                title = html_lib.unescape(
+                    re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1",
+                           re.sub(r"<[^>]+>", "", t_m.group(1)))).strip()
+                if not title or len(title) < 5:
+                    continue
+                # Link
+                l_m = re.search(r'<link[^>]+href="([^"]+)"', entry)
+                if not l_m:
+                    l_m = re.search(r"<link>(https?://[^<]+)</link>", entry)
+                link = l_m.group(1).strip() if l_m else "#"
+                # Date
+                d_m = re.search(r"<updated>(.*?)</updated>", entry)
+                if not d_m:
+                    d_m = re.search(r"<pubDate>(.*?)</pubDate>", entry)
+                try:
+                    from email.utils import parsedate_to_datetime
+                    raw_date = d_m.group(1).strip() if d_m else ""
+                    if "T" in raw_date:
+                        from datetime import datetime as _dt
+                        dt_str = _dt.fromisoformat(raw_date.replace("Z","+00:00")).strftime("%m/%d %H:%M")
+                    else:
+                        dt_str = parsedate_to_datetime(raw_date).strftime("%m/%d %H:%M")
+                except Exception:
+                    dt_str = ""
+                s = _classify(title)
+                if s == "bull":   bull += 1
+                elif s == "bear": bear += 1
+                posts.append({"title": title, "sentiment": s,
+                              "score": 0, "comments": 0,
+                              "url": link, "sub": sub, "time": dt_str})
+        except Exception:
+            continue
 
-    # ── Try 2: scan r/sub new feed, filter mentions ──────────────────────
+    # ── Strategy 2: Reddit JSON API ──────────────────────────────────────
     if len(posts) < 3:
-        for sub, lim in [("wallstreetbets", 100), ("stocks", 100)]:
-            try:
-                resp = requests.get(
-                    "https://www.reddit.com/r/" + sub + "/new.json?limit=" + str(lim),
-                    timeout=12, headers=headers)
-                if resp.status_code != 200:
-                    continue
-                for item in resp.json().get("data", {}).get("children", []):
-                    d = item.get("data", {})
-                    title = d.get("title", "")
-                    body  = d.get("selftext", "")[:300]
-                    if not _sym_in(title + " " + body):
+        for sub in ["wallstreetbets", "stocks", "investing"]:
+            if len(posts) >= 8:
+                break
+            for endpoint in [
+                f"https://www.reddit.com/r/{sub}/search.json?q={sym_up}&sort=new&limit=20&restrict_sr=1",
+                f"https://www.reddit.com/r/{sub}/search.json?q=%24{sym_up}&sort=new&limit=20&restrict_sr=1",
+            ]:
+                try:
+                    resp = requests.get(endpoint, timeout=10, headers=api_headers)
+                    if resp.status_code != 200:
                         continue
-                    p = _make_post(d, sub)
-                    if p:
-                        posts.append(p)
-                        if p["sentiment"] == "bull": bull += 1
-                        elif p["sentiment"] == "bear": bear += 1
-            except Exception:
-                continue
+                    for item in resp.json().get("data", {}).get("children", []):
+                        d     = item.get("data", {})
+                        title = html_lib.unescape(d.get("title", "")).strip()
+                        if not title:
+                            continue
+                        s = _classify(title)
+                        if s == "bull":   bull += 1
+                        elif s == "bear": bear += 1
+                        posts.append({"title": title, "sentiment": s,
+                                      "score": d.get("score", 0),
+                                      "comments": d.get("num_comments", 0),
+                                      "url": "https://reddit.com" + d.get("permalink",""),
+                                      "sub": sub,
+                                      "time": _ts_to_str(d.get("created_utc", 0))})
+                    if posts:
+                        break
+                except Exception:
+                    continue
 
-    # ── Try 3: global Reddit search ─────────────────────────────────────
+    # ── Strategy 3: Global Reddit RSS search ─────────────────────────────
     if not posts:
         try:
-            resp = requests.get(
-                "https://www.reddit.com/search.json?q=" + symbol + "+stock&sort=new&limit=20",
-                timeout=10, headers=headers)
+            url  = f"https://www.reddit.com/search.rss?q={sym_up}+stock&sort=new&limit=20"
+            resp = requests.get(url, timeout=10, headers=rss_headers)
             if resp.status_code == 200:
-                for item in resp.json().get("data", {}).get("children", []):
-                    p = _make_post(item.get("data", {}),
-                                   item.get("data", {}).get("subreddit", "reddit"))
-                    if p:
-                        posts.append(p)
-                        if p["sentiment"] == "bull": bull += 1
-                        elif p["sentiment"] == "bear": bear += 1
+                for entry in re.findall(r"<entry>(.*?)</entry>", resp.text, re.DOTALL)[:15]:
+                    t_m = re.search(r"<title[^>]*>(.*?)</title>", entry, re.DOTALL)
+                    if not t_m:
+                        continue
+                    title = html_lib.unescape(
+                        re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1",
+                               re.sub(r"<[^>]+>", "", t_m.group(1)))).strip()
+                    if not title:
+                        continue
+                    l_m = re.search(r'<link[^>]+href="([^"]+)"', entry)
+                    link = l_m.group(1) if l_m else "#"
+                    s = _classify(title)
+                    if s == "bull":   bull += 1
+                    elif s == "bear": bear += 1
+                    posts.append({"title": title, "sentiment": s,
+                                  "score": 0, "comments": 0,
+                                  "url": link, "sub": "reddit", "time": ""})
         except Exception:
             pass
 
