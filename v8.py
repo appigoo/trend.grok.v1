@@ -659,111 +659,186 @@ def _classify(text: str) -> str:
     if br > b:   return "bear"
     return "neu"
 
+def _parse_yf_news_item(item):
+    import html as html_lib
+    from datetime import timezone, datetime as _dt
+    content = item.get("content", {})
+    if content and isinstance(content, dict):
+        title     = html_lib.unescape(content.get("title", "")).strip()
+        summary   = html_lib.unescape(content.get("summary", "")).strip()
+        link      = (content.get("canonicalUrl") or {}).get("url", "#")
+        publisher = (content.get("provider") or {}).get("displayName", "")
+        pub_date  = content.get("pubDate", "")
+        try:
+            dt_str = _dt.strptime(pub_date[:16], "%Y-%m-%dT%H:%M").strftime("%m/%d %H:%M")
+        except Exception:
+            dt_str = pub_date[:16]
+    else:
+        title     = html_lib.unescape(item.get("title", "")).strip()
+        summary   = html_lib.unescape(item.get("summary", "")).strip()
+        link      = item.get("link", "#")
+        publisher = item.get("publisher", "")
+        ts        = item.get("providerPublishTime", 0)
+        dt_str    = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
+    if not title:
+        return None
+    return {"title": title, "summary": summary[:120], "link": link,
+            "publisher": publisher, "time": dt_str}
+
+
 @st.cache_data(ttl=180)
 def fetch_stocktwits(symbol: str) -> dict:
-    """Yahoo Finance news via yfinance.Ticker.news (no API key needed)"""
-    import html as html_lib
+    import html as html_lib, re
+    bull = bear = 0.0
+    parsed = []
+
+    # Source 1: yfinance Ticker.news (handles old + new format)
     try:
-        ticker   = yf.Ticker(symbol)
-        raw_news = ticker.news or []
-        bull = bear = 0.0
-        parsed = []
-        for item in raw_news[:25]:
-            title   = html_lib.unescape(item.get("title", "")).strip()
-            summary = html_lib.unescape(item.get("summary", "")).strip()
-            if not title:
+        raw_news = yf.Ticker(symbol).news or []
+        for item in raw_news[:30]:
+            p = _parse_yf_news_item(item)
+            if not p:
                 continue
-            s = _classify(f"{title} {summary}")
+            s = _classify(p["title"] + " " + p["summary"])
             if s == "bull":   bull += 1
             elif s == "bear": bear += 1
-            ts = item.get("providerPublishTime", 0)
-            from datetime import timezone
-            dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
-            parsed.append({"body": title, "summary": summary[:120],
-                           "sentiment": s, "time": dt_str,
-                           "publisher": item.get("publisher",""),
-                           "link": item.get("link","#")})
-        total    = bull + bear
-        bull_pct = round(bull / total * 100) if total else 50
-        return {"bull": int(bull), "bear": int(bear), "total": int(total),
-                "bull_pct": bull_pct, "bear_pct": 100 - bull_pct,
-                "score": bull_pct, "messages": parsed[:10], "watchlist": 0,
-                "source": "Yahoo Finance News"}
-    except Exception as e:
-        return {"error": str(e)}
+            parsed.append({"body": p["title"], "summary": p["summary"],
+                           "sentiment": s, "time": p["time"],
+                           "publisher": p["publisher"], "link": p["link"]})
+    except Exception:
+        pass
+
+    # Source 2: Google News RSS fallback
+    if not parsed:
+        try:
+            url  = ("https://news.google.com/rss/search"
+                    "?q=" + symbol + "+stock&hl=en-US&gl=US&ceid=US:en")
+            resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                for block in re.findall(r"<item>(.*?)</item>", resp.text, re.DOTALL)[:20]:
+                    t_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL)
+                    l_m = re.search(r"<link>(https?://\S+?)</link>", block)
+                    d_m = re.search(r"<pubDate>(.*?)</pubDate>", block)
+                    if not t_m:
+                        continue
+                    title = html_lib.unescape(re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"",
+                                                      t_m.group(1))).strip()
+                    link  = l_m.group(1).strip() if l_m else "#"
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        dt_str = parsedate_to_datetime(d_m.group(1)).strftime("%m/%d %H:%M") if d_m else ""
+                    except Exception:
+                        dt_str = ""
+                    s = _classify(title)
+                    if s == "bull":   bull += 1
+                    elif s == "bear": bear += 1
+                    parsed.append({"body": title, "summary": "", "sentiment": s,
+                                   "time": dt_str, "publisher": "Google News", "link": link})
+        except Exception:
+            pass
+
+    total    = bull + bear
+    bull_pct = round(bull / total * 100) if total else 50
+    return {"bull": int(bull), "bear": int(bear), "total": int(total),
+            "bull_pct": bull_pct, "bear_pct": 100 - bull_pct,
+            "score": bull_pct, "messages": parsed[:12], "watchlist": 0,
+            "source": "Yahoo Finance / Google News"}
 
 
 @st.cache_data(ttl=300)
 def fetch_reddit_sentiment(symbol: str) -> dict:
-    """Reddit via public JSON feeds - scan new posts and filter by symbol mention"""
     import html as html_lib
+    from datetime import timezone
     posts = []
     bull = bear = 0
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)", "Accept": "application/json"}
     sym_lower = symbol.lower()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
 
-    # Strategy 1: scan subreddit new feed, filter by symbol mention
-    for sub, limit in [("wallstreetbets", 100), ("stocks", 50), ("investing", 50)]:
-        try:
-            resp = requests.get(f"https://www.reddit.com/r/{sub}/new.json?limit={limit}",
-                                timeout=10, headers=headers)
-            if resp.status_code != 200:
-                continue
-            for item in resp.json().get("data", {}).get("children", []):
-                d     = item.get("data", {})
-                title = html_lib.unescape(d.get("title", "")).strip()
-                body  = html_lib.unescape(d.get("selftext", "")).strip()[:200]
-                if not title:
-                    continue
-                combined = f"{title} {body}".lower()
-                # must mention ticker
-                if (f"${sym_lower}" not in combined and
-                    f" {sym_lower} " not in combined and
-                    f" {sym_lower}," not in combined and
-                    not combined.startswith(sym_lower)):
-                    continue
-                s = _classify(f"{title} {body}")
-                if s == "bull":   bull += 1
-                elif s == "bear": bear += 1
-                from datetime import timezone
-                ts       = d.get("created_utc", 0)
-                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
-                posts.append({"title": title, "sentiment": s,
-                              "score": d.get("score", 0),
-                              "comments": d.get("num_comments", 0),
-                              "url": "https://reddit.com" + d.get("permalink", ""),
-                              "sub": sub, "time": time_str})
-        except Exception:
-            continue
+    def _make_post(d, sub):
+        title = html_lib.unescape(d.get("title", "")).strip()
+        if not title:
+            return None
+        ts  = d.get("created_utc", 0)
+        tstr = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
+        return {"title": title, "sentiment": _classify(title),
+                "score": d.get("score", 0), "comments": d.get("num_comments", 0),
+                "url": "https://reddit.com" + d.get("permalink", ""),
+                "sub": sub, "time": tstr}
 
-    # Strategy 2: search without time restriction if nothing found
-    if not posts:
-        for sub in ["wallstreetbets", "stocks"]:
+    def _sym_in(text):
+        t = text.lower()
+        return (sym_lower in t or
+                "$" + sym_lower in t or
+                sym_lower.upper() in text)
+
+    # ── Try 1: subreddit search (most relevant) ──────────────────────────
+    for sub in ["wallstreetbets", "stocks", "investing", "StockMarket"]:
+        if len(posts) >= 10:
+            break
+        for sort in ["new", "hot"]:
             try:
-                url  = (f"https://www.reddit.com/r/{sub}/search.json"
-                        f"?q={symbol}&sort=new&limit=25&restrict_sr=1")
+                url  = ("https://www.reddit.com/r/" + sub + "/search.json"
+                        "?q=" + symbol + "&sort=" + sort + "&limit=25&restrict_sr=1")
                 resp = requests.get(url, timeout=10, headers=headers)
                 if resp.status_code != 200:
                     continue
                 for item in resp.json().get("data", {}).get("children", []):
-                    d     = item.get("data", {})
-                    title = html_lib.unescape(d.get("title", "")).strip()
-                    if not title:
-                        continue
-                    s = _classify(title)
-                    if s == "bull":   bull += 1
-                    elif s == "bear": bear += 1
-                    posts.append({"title": title, "sentiment": s,
-                                  "score": d.get("score", 0),
-                                  "comments": d.get("num_comments", 0),
-                                  "url": "https://reddit.com" + d.get("permalink", ""),
-                                  "sub": sub, "time": ""})
+                    p = _make_post(item.get("data", {}), sub)
+                    if p:
+                        posts.append(p)
+                        if p["sentiment"] == "bull": bull += 1
+                        elif p["sentiment"] == "bear": bear += 1
+                if posts:
+                    break
             except Exception:
                 continue
 
+    # ── Try 2: scan r/sub new feed, filter mentions ──────────────────────
+    if len(posts) < 3:
+        for sub, lim in [("wallstreetbets", 100), ("stocks", 100)]:
+            try:
+                resp = requests.get(
+                    "https://www.reddit.com/r/" + sub + "/new.json?limit=" + str(lim),
+                    timeout=12, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                for item in resp.json().get("data", {}).get("children", []):
+                    d = item.get("data", {})
+                    title = d.get("title", "")
+                    body  = d.get("selftext", "")[:300]
+                    if not _sym_in(title + " " + body):
+                        continue
+                    p = _make_post(d, sub)
+                    if p:
+                        posts.append(p)
+                        if p["sentiment"] == "bull": bull += 1
+                        elif p["sentiment"] == "bear": bear += 1
+            except Exception:
+                continue
+
+    # ── Try 3: global Reddit search ─────────────────────────────────────
+    if not posts:
+        try:
+            resp = requests.get(
+                "https://www.reddit.com/search.json?q=" + symbol + "+stock&sort=new&limit=20",
+                timeout=10, headers=headers)
+            if resp.status_code == 200:
+                for item in resp.json().get("data", {}).get("children", []):
+                    p = _make_post(item.get("data", {}),
+                                   item.get("data", {}).get("subreddit", "reddit"))
+                    if p:
+                        posts.append(p)
+                        if p["sentiment"] == "bull": bull += 1
+                        elif p["sentiment"] == "bear": bear += 1
+        except Exception:
+            pass
+
     total    = bull + bear
     bull_pct = round(bull / total * 100) if total else 50
-    return {"bull": bull, "bear": bear, "total": total,
+    return {"bull": int(bull), "bear": int(bear), "total": int(total),
             "bull_pct": bull_pct, "bear_pct": 100 - bull_pct,
             "score": bull_pct, "posts": posts[:10]}
 
