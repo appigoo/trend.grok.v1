@@ -2082,8 +2082,41 @@ with st.sidebar:
                                ["並排（2欄）", "堆疊（全寬）"], horizontal=True)
 
     st.markdown("---")
-    auto_refresh = st.toggle("自動刷新", value=False)
-    refresh_sec  = st.slider("刷新間隔（秒）", 60, 300, 60, step=30, disabled=not auto_refresh)
+    st.markdown("**🔄 自動監控**")
+
+    if "monitoring" not in st.session_state:
+        st.session_state.monitoring = False
+
+    col_start, col_stop = st.columns(2)
+    with col_start:
+        if st.button("▶ 啟動監控", use_container_width=True,
+                     type="primary" if not st.session_state.monitoring else "secondary",
+                     disabled=st.session_state.monitoring):
+            st.session_state.monitoring = True
+            st.rerun()
+    with col_stop:
+        if st.button("⏹ 停止監控", use_container_width=True,
+                     type="primary" if st.session_state.monitoring else "secondary",
+                     disabled=not st.session_state.monitoring):
+            st.session_state.monitoring = False
+            st.rerun()
+
+    if st.session_state.monitoring:
+        st.markdown(
+            '<div style="background:#0d2e18;border:1px solid #00aa44;border-radius:6px;'
+            'padding:6px 12px;font-size:0.82rem;color:#00ee66;text-align:center;">'
+            '🟢 監控中 — 自動刷新中</div>',
+            unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div style="background:#1a1e2e;border:1px solid #334466;border-radius:6px;'
+            'padding:6px 12px;font-size:0.82rem;color:#556688;text-align:center;">'
+            '⏸ 已暫停 — 點「啟動」開始監控</div>',
+            unsafe_allow_html=True)
+
+    refresh_sec  = st.slider("刷新間隔（秒）", 30, 300, 60, step=30,
+                             disabled=not st.session_state.monitoring)
+    auto_refresh = st.session_state.monitoring
 
     st.markdown("---")
     st.markdown("**📊 K 線顯示根數**")
