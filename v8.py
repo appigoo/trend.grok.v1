@@ -2028,6 +2028,12 @@ def render_single(symbol, interval, show_alerts, max_bars=90):
         run_alerts(symbol, label, df,
                    trigger_ai=show_ai, mkt=mkt_data)
 
+    # ── AI 技術分析面板 ─────────────────────────────────────────────────────
+    if show_ai:
+        mkt = fetch_market_data() if show_market else {}
+        st.markdown("---")
+        render_ai_analysis(symbol, label, df, mkt=mkt)
+
     # Social sentiment panel
     if show_social:
         st.markdown("---")
