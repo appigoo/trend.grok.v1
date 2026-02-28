@@ -643,87 +643,124 @@ def render_market_environment():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Social Sentiment Module (StockTwits + Reddit)
+# Social Sentiment Module (Yahoo Finance News + Reddit)
 # ══════════════════════════════════════════════════════════════════════════════
+
+BULL_KW = ["bull","buy","long","up","breakout","moon","calls","support","surge",
+           "rally","gain","beat","strong","upgrade","record","growth","jump","soar"]
+BEAR_KW = ["bear","sell","short","down","crash","puts","drop","dump","fall",
+           "decline","miss","weak","downgrade","loss","risk","fear","slump","warn"]
+
+def _classify(text: str) -> str:
+    tl = text.lower()
+    b  = sum(1 for w in BULL_KW if w in tl)
+    br = sum(1 for w in BEAR_KW if w in tl)
+    if b > br:   return "bull"
+    if br > b:   return "bear"
+    return "neu"
 
 @st.cache_data(ttl=180)
 def fetch_stocktwits(symbol: str) -> dict:
-    import html as html_lib, re
+    """Yahoo Finance news via yfinance.Ticker.news (no API key needed)"""
+    import html as html_lib
     try:
-        url  = f"https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json?limit=30"
-        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return {}
-        data     = resp.json()
-        wl_count = data.get("symbol", {}).get("watchlist_count", 0)
-        messages = data.get("messages", [])
+        ticker   = yf.Ticker(symbol)
+        raw_news = ticker.news or []
         bull = bear = 0.0
         parsed = []
-        bull_kw = ["bull","buy","long","up","breakout","moon","calls","support"]
-        bear_kw = ["bear","sell","short","down","crash","puts","drop","dump"]
-        for msg in messages:
-            sent_label = (msg.get("entities", {}).get("sentiment", {}) or {}).get("basic", "")
-            body = html_lib.unescape(msg.get("body", "")).strip()
-            body = re.sub(r"https?\S+", "", body).strip()
-            if len(body) < 8:
+        for item in raw_news[:25]:
+            title   = html_lib.unescape(item.get("title", "")).strip()
+            summary = html_lib.unescape(item.get("summary", "")).strip()
+            if not title:
                 continue
-            bl = body.lower()
-            if sent_label == "Bullish":
-                s = "bull"; bull += 1
-            elif sent_label == "Bearish":
-                s = "bear"; bear += 1
-            elif any(w in bl for w in bull_kw):
-                s = "bull"; bull += 0.5
-            elif any(w in bl for w in bear_kw):
-                s = "bear"; bear += 0.5
-            else:
-                s = "neu"
-            user  = msg.get("user", {}).get("username", "anon")
-            ts    = msg.get("created_at", "")[:16].replace("T", " ")
-            likes = msg.get("likes", {}).get("total", 0)
-            parsed.append({"body": body, "sentiment": s,
-                           "user": user, "time": ts, "likes": likes})
+            s = _classify(f"{title} {summary}")
+            if s == "bull":   bull += 1
+            elif s == "bear": bear += 1
+            ts = item.get("providerPublishTime", 0)
+            from datetime import timezone
+            dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
+            parsed.append({"body": title, "summary": summary[:120],
+                           "sentiment": s, "time": dt_str,
+                           "publisher": item.get("publisher",""),
+                           "link": item.get("link","#")})
         total    = bull + bear
         bull_pct = round(bull / total * 100) if total else 50
         return {"bull": int(bull), "bear": int(bear), "total": int(total),
                 "bull_pct": bull_pct, "bear_pct": 100 - bull_pct,
-                "score": bull_pct, "messages": parsed[:12], "watchlist": wl_count}
+                "score": bull_pct, "messages": parsed[:10], "watchlist": 0,
+                "source": "Yahoo Finance News"}
     except Exception as e:
         return {"error": str(e)}
 
 
 @st.cache_data(ttl=300)
 def fetch_reddit_sentiment(symbol: str) -> dict:
+    """Reddit via public JSON feeds - scan new posts and filter by symbol mention"""
     import html as html_lib
-    bull_kw = ["moon","rocket","calls","buy","long","bullish","gain","up",
-               "breakout","green","yolo","undervalued"]
-    bear_kw = ["crash","drop","fall","short","put","bearish","sell","dump",
-               "loss","red","down","overvalued","bubble"]
     posts = []
     bull = bear = 0
-    for sub in ["wallstreetbets", "stocks", "investing"]:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)", "Accept": "application/json"}
+    sym_lower = symbol.lower()
+
+    # Strategy 1: scan subreddit new feed, filter by symbol mention
+    for sub, limit in [("wallstreetbets", 100), ("stocks", 50), ("investing", 50)]:
         try:
-            url  = (f"https://www.reddit.com/r/{sub}/search.json"
-                    f"?q={symbol}&sort=new&limit=15&t=day&restrict_sr=1")
-            resp = requests.get(url, timeout=8, headers={"User-Agent": "StockMonitor/1.0"})
+            resp = requests.get(f"https://www.reddit.com/r/{sub}/new.json?limit={limit}",
+                                timeout=10, headers=headers)
             if resp.status_code != 200:
                 continue
             for item in resp.json().get("data", {}).get("children", []):
                 d     = item.get("data", {})
                 title = html_lib.unescape(d.get("title", "")).strip()
+                body  = html_lib.unescape(d.get("selftext", "")).strip()[:200]
                 if not title:
                     continue
-                tl = title.lower()
-                if   any(w in tl for w in bear_kw): s = "bear"; bear += 1
-                elif any(w in tl for w in bull_kw): s = "bull"; bull += 1
-                else:                               s = "neu"
+                combined = f"{title} {body}".lower()
+                # must mention ticker
+                if (f"${sym_lower}" not in combined and
+                    f" {sym_lower} " not in combined and
+                    f" {sym_lower}," not in combined and
+                    not combined.startswith(sym_lower)):
+                    continue
+                s = _classify(f"{title} {body}")
+                if s == "bull":   bull += 1
+                elif s == "bear": bear += 1
+                from datetime import timezone
+                ts       = d.get("created_utc", 0)
+                time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m/%d %H:%M") if ts else ""
                 posts.append({"title": title, "sentiment": s,
                               "score": d.get("score", 0),
                               "comments": d.get("num_comments", 0),
                               "url": "https://reddit.com" + d.get("permalink", ""),
-                              "sub": sub})
+                              "sub": sub, "time": time_str})
         except Exception:
             continue
+
+    # Strategy 2: search without time restriction if nothing found
+    if not posts:
+        for sub in ["wallstreetbets", "stocks"]:
+            try:
+                url  = (f"https://www.reddit.com/r/{sub}/search.json"
+                        f"?q={symbol}&sort=new&limit=25&restrict_sr=1")
+                resp = requests.get(url, timeout=10, headers=headers)
+                if resp.status_code != 200:
+                    continue
+                for item in resp.json().get("data", {}).get("children", []):
+                    d     = item.get("data", {})
+                    title = html_lib.unescape(d.get("title", "")).strip()
+                    if not title:
+                        continue
+                    s = _classify(title)
+                    if s == "bull":   bull += 1
+                    elif s == "bear": bear += 1
+                    posts.append({"title": title, "sentiment": s,
+                                  "score": d.get("score", 0),
+                                  "comments": d.get("num_comments", 0),
+                                  "url": "https://reddit.com" + d.get("permalink", ""),
+                                  "sub": sub, "time": ""})
+            except Exception:
+                continue
+
     total    = bull + bear
     bull_pct = round(bull / total * 100) if total else 50
     return {"bull": bull, "bear": bear, "total": total,
@@ -770,32 +807,34 @@ def render_social_sentiment(symbol: str):
         with st.spinner("Loading StockTwits..."):
             st_data = fetch_stocktwits(symbol)
         if not st_data or "error" in st_data:
+            err = st_data.get("error","") if st_data else ""
             st.markdown(
-                '<div class="social-panel"><div class="social-title">STOCKTWITS</div>'
-                '<div style="color:#445566;font-size:0.82rem;">Unable to load</div></div>',
+                f'<div class="social-panel"><div class="social-title">📰 Yahoo Finance News</div>'
+                f'<div style="color:#445566;font-size:0.82rem;">Unable to load{(": "+err[:80]) if err else ""}</div></div>',
                 unsafe_allow_html=True)
         else:
             sc = st_data["score"]
             color, lbl = sentiment_label_color(sc)
             stat = (
                 f'<div class="social-stat-row">'
-                f'<div class="social-stat">Bull <b style="color:#00ee66">{st_data["bull"]}</b></div>'
-                f'<div class="social-stat">Bear <b style="color:#ff4444">{st_data["bear"]}</b></div>'
-                f'<div class="social-stat">Total <b>{st_data["total"]}</b></div>'
-                f'<div class="social-stat">Watchlist <b>{st_data.get("watchlist",0):,}</b></div>'
+                f'<div class="social-stat">Bullish <b style="color:#00ee66">{st_data["bull"]}</b></div>'
+                f'<div class="social-stat">Bearish <b style="color:#ff4444">{st_data["bear"]}</b></div>'
+                f'<div class="social-stat">Total <b>{st_data["total"]}</b> articles</div>'
                 f'</div>'
             )
             gauge = _gauge_html(sc, color, lbl, st_data["bull_pct"])
-            parts = [f'<div class="social-panel"><div class="social-title">STOCKTWITS Sentiment</div>{stat}{gauge}']
-            for m in st_data.get("messages", [])[:6]:
-                cls  = "social-tweet-" + m["sentiment"]
-                icon = "BUL" if m["sentiment"]=="bull" else "BEA" if m["sentiment"]=="bear" else "NEU"
-                icon = {"bull":"🟢","bear":"🔴","neu":"⚪"}[m["sentiment"]]
-                lk   = f'{m["likes"]} likes' if m["likes"] else ""
+            parts = [f'<div class="social-panel"><div class="social-title">📰 Yahoo Finance News Sentiment</div>{stat}{gauge}']
+            for m in st_data.get("messages", [])[:8]:
+                cls   = "social-tweet-" + m["sentiment"]
+                icon  = {"bull":"🟢","bear":"🔴","neu":"⚪"}[m["sentiment"]]
+                link  = m.get("link","#")
+                pub   = m.get("publisher","")
+                ts    = m.get("time","")
+                summ  = m.get("summary","")
                 parts.append(
-                    f'<div class="social-tweet {cls}">{icon} {m["body"][:160]}'
-                    f'<div class="social-tweet-meta"><span>@{m["user"]}</span>'
-                    f'<span>{m["time"]}</span><span>{lk}</span></div></div>'
+                    f'<div class="social-tweet {cls}">{icon} '
+                    f'<a href="{link}" target="_blank" style="color:#ccd6ee;text-decoration:none;font-weight:500;">{m["body"][:160]}</a>'
+                    f'<div class="social-tweet-meta"><span>{pub}</span><span>{ts}</span></div></div>'
                 )
             parts.append("</div>")
             st.markdown("".join(parts), unsafe_allow_html=True)
@@ -824,12 +863,14 @@ def render_social_sentiment(symbol: str):
             for p in rd_data.get("posts", [])[:6]:
                 cls  = "social-tweet-" + p["sentiment"]
                 icon = {"bull":"🟢","bear":"🔴","neu":"⚪"}[p["sentiment"]]
+                ts_str = p.get("time","")
                 parts.append(
                     f'<div class="social-tweet {cls}">{icon} '
                     f'<a href="{p["url"]}" target="_blank" style="color:#99aacc;text-decoration:none;">'
                     f'{p["title"][:160]}</a>'
                     f'<div class="social-tweet-meta"><span>r/{p["sub"]}</span>'
-                    f'<span>{p["score"]} pts</span><span>{p["comments"]} comments</span></div></div>'
+                    f'<span>{p["score"]} pts</span><span>{p["comments"]} cmts</span>'
+                    f'<span>{ts_str}</span></div></div>'
                 )
             parts.append("</div>")
             st.markdown("".join(parts), unsafe_allow_html=True)
