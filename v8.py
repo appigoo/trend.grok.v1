@@ -1492,13 +1492,9 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
 @st.cache_data(ttl=60)
 def fetch_extended_data(symbol: str) -> dict:
     """
-    Fetch pre/post/overnight bars from Alpaca (free, real-time).
-    Falls back to yfinance if no Alpaca key configured.
-
-    Alpaca free tier:  https://alpaca.markets  (sign up with email, no credit card)
-    Set in secrets.toml:
-        ALPACA_API_KEY    = "PKxxxxxxxx"
-        ALPACA_SECRET_KEY = "xxxxxxxx"
+    Fetch pre/post/overnight bars via Yahoo Finance chart API.
+    No API key needed. Uses the same endpoint as Yahoo Finance website.
+    Extended hours data available via includePrePost=True parameter.
     """
     result = {
         "pre": pd.DataFrame(), "post": pd.DataFrame(),
@@ -1509,19 +1505,20 @@ def fetch_extended_data(symbol: str) -> dict:
         "source": "none", "trading_date": "",
     }
 
-    def _get_alpaca_keys():
+    def _to_et(df):
         try:
-            return st.secrets["ALPACA_API_KEY"], st.secrets["ALPACA_SECRET_KEY"]
-        except Exception:
-            pass
-        k = st.session_state.get("alpaca_api_key", "")
-        s = st.session_state.get("alpaca_secret_key", "")
-        return k, s
+            import pytz
+            et = pytz.timezone("America/New_York")
+        except ImportError:
+            import datetime as _dt
+            et = _dt.timezone(_dt.timedelta(hours=-5))
+        if df.index.tzinfo is None:
+            return df.tz_localize("UTC").tz_convert(et)
+        return df.tz_convert(et)
 
     def _split_sessions(df_et):
-        """Split an ET-timezone DataFrame into session DataFrames."""
         if df_et.empty:
-            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight"]}
+            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight","trading_date"]}
 
         def _reg(d):
             m = ((df_et.index.date == d) &
@@ -1545,23 +1542,25 @@ def fetch_extended_data(symbol: str) -> dict:
         def _night(d):
             import datetime as _dt
             nd = d + _dt.timedelta(days=1)
-            m  = (((df_et.index.date == d)  & (df_et.index.hour >= 20)) |
-                  ((df_et.index.date == nd) & (df_et.index.hour <  4)))
+            m = (((df_et.index.date == d)  & (df_et.index.hour >= 20)) |
+                 ((df_et.index.date == nd) & (df_et.index.hour <  4)))
             return df_et[m].copy()
 
-        # find most recent date with regular bars
-        reg_mask = ((df_et.index.hour > 9) |
-                    ((df_et.index.hour == 9) & (df_et.index.minute >= 30))) &                    (df_et.index.hour < 16)
+        # Find most recent day with regular session bars
+        reg_mask = (
+            ((df_et.index.hour > 9) |
+             ((df_et.index.hour == 9) & (df_et.index.minute >= 30))) &
+            (df_et.index.hour < 16)
+        )
         dates = sorted(set(df_et.index[reg_mask].date), reverse=True)
         if not dates:
-            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight"]}
+            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight","trading_date"]}
 
-        d0 = dates[0]
-        reg   = _reg(d0)
-        pre   = _pre(d0)
+        d0  = dates[0]
+        reg = _reg(d0)
+        pre = _pre(d0)
         post  = _post(d0)
         night = _night(d0)
-        # fallback to previous day for pre/post
         if pre.empty   and len(dates) > 1: pre   = _pre(dates[1])
         if post.empty  and len(dates) > 1: post  = _post(dates[1])
         if night.empty and len(dates) > 1: night = _night(dates[1])
@@ -1575,166 +1574,97 @@ def fetch_extended_data(symbol: str) -> dict:
         ref  = ref or float(sdf["Close"].iloc[0])
         last = float(sdf["Close"].iloc[-1])
         return {
-            "open":  float(sdf["Close"].iloc[0]),
-            "close": last,
-            "high":  float(sdf["High"].max()),
-            "low":   float(sdf["Low"].min()),
+            "open":   float(sdf["Close"].iloc[0]),
+            "close":  last,
+            "high":   float(sdf["High"].max()),
+            "low":    float(sdf["Low"].min()),
             "volume": int(sdf["Volume"].sum()),
-            "chg":   last - ref,
-            "pct":   (last - ref) / ref * 100 if ref else 0,
-            "bars":  len(sdf),
-            "date":  str(sdf.index[-1].date()),
+            "chg":    last - ref,
+            "pct":    (last - ref) / ref * 100 if ref else 0,
+            "bars":   len(sdf),
+            "date":   str(sdf.index[-1].date()),
         }
 
-    def _to_et(df):
-        """Convert DataFrame index to US/Eastern."""
-        try:
-            import pytz
-            et = pytz.timezone("America/New_York")
-        except ImportError:
-            import datetime as _dt
-            et = _dt.timezone(_dt.timedelta(hours=-5))
-        if df.index.tzinfo is None:
-            return df.tz_localize("UTC").tz_convert(et)
-        return df.tz_convert(et)
-
-    # ── Try Alpaca ────────────────────────────────────────────────────────
-    api_key, secret_key = _get_alpaca_keys()
-    if api_key and secret_key:
-        try:
-            import datetime as _dt
-            # Fetch 2 days of 1-min bars (covers overnight + pre + regular + post)
-            end_dt   = _dt.datetime.utcnow()
-            start_dt = end_dt - _dt.timedelta(days=3)
-            url = (
-                "https://data.alpaca.markets/v2/stocks/bars"
-                f"?symbols={symbol}"
-                f"&timeframe=1Min"
-                f"&start={start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                f"&end={end_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-                f"&limit=10000"
-                f"&feed=iex"          # free IEX feed (real-time, no delay)
-                f"&adjustment=raw"
-            )
-            resp = requests.get(
-                url,
-                headers={
-                    "APCA-API-KEY-ID":     api_key,
-                    "APCA-API-SECRET-KEY": secret_key,
-                },
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                bars = resp.json().get("bars", {}).get(symbol, [])
-                if bars:
-                    df = pd.DataFrame(bars)
-                    df.index = pd.to_datetime(df["t"])
-                    df = df.rename(columns={
-                        "o": "Open", "h": "High", "l": "Low",
-                        "c": "Close", "v": "Volume"
-                    })[["Open","High","Low","Close","Volume"]]
-                    df = _to_et(df)
-                    df.dropna(inplace=True)
-
-                    sessions = _split_sessions(df)
-                    reg      = sessions["regular"]
-                    reg_close = float(reg["Close"].iloc[-1]) if not reg.empty else None
-
-                    result.update({
-                        "pre":            sessions["pre"],
-                        "post":           sessions["post"],
-                        "overnight":      sessions["overnight"],
-                        "regular":        reg,
-                        "pre_info":       _summary(sessions["pre"],       reg_close),
-                        "post_info":      _summary(sessions["post"],      reg_close),
-                        "overnight_info": _summary(sessions["overnight"], reg_close),
-                        "regular_info":   _summary(reg),
-                        "reg_close":      reg_close,
-                        "trading_date":   sessions.get("trading_date",""),
-                        "source":         "Alpaca (real-time)",
-                    })
-                    return result
-            elif resp.status_code == 401:
-                result["error"] = "Alpaca API Key 無效，請確認"
-                return result
-            else:
-                # Fall through to yfinance
-                pass
-        except Exception as e:
-            pass  # Fall through to yfinance
-
-    # ── Fallback: yfinance (delayed/unreliable for extended hours) ────────
+    # ── Yahoo Finance Chart API (no key needed) ───────────────────────────────
+    # Interval 1m with range 5d + includePrePost=True
     try:
-        t  = yf.Ticker(symbol)
-        df = t.history(period="5d", interval="1m", prepost=True, auto_adjust=True)
-        if df.empty:
-            result["error"] = "無數據（yfinance 回傳空）"
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            f"?interval=1m&range=5d&includePrePost=true"
+            f"&events=div%2Csplits&corsDomain=finance.yahoo.com"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/122.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://finance.yahoo.com",
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+
+        if resp.status_code == 200:
+            data   = resp.json()
+            chart  = data.get("chart", {})
+            result_data = chart.get("result", [])
+            if not result_data:
+                err = chart.get("error", {})
+                result["error"] = f"Yahoo 無數據: {err}"
+                return result
+
+            r          = result_data[0]
+            timestamps = r.get("timestamp", [])
+            quotes     = r.get("indicators", {}).get("quote", [{}])[0]
+
+            if not timestamps:
+                result["error"] = "Yahoo 回傳空時間序列"
+                return result
+
+            df = pd.DataFrame({
+                "Open":   quotes.get("open",   [None]*len(timestamps)),
+                "High":   quotes.get("high",   [None]*len(timestamps)),
+                "Low":    quotes.get("low",    [None]*len(timestamps)),
+                "Close":  quotes.get("close",  [None]*len(timestamps)),
+                "Volume": quotes.get("volume", [0]*len(timestamps)),
+            }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+
+            df = _to_et(df)
+            df = df.dropna(subset=["Close"])
+            df["Volume"] = df["Volume"].fillna(0).astype(int)
+
+            sessions  = _split_sessions(df)
+            reg       = sessions["regular"]
+            reg_close = float(reg["Close"].iloc[-1]) if not reg.empty else None
+
+            has_ext = not sessions["pre"].empty or not sessions["post"].empty
+            result.update({
+                "pre":            sessions["pre"],
+                "post":           sessions["post"],
+                "overnight":      sessions["overnight"],
+                "regular":        reg,
+                "pre_info":       _summary(sessions["pre"],       reg_close),
+                "post_info":      _summary(sessions["post"],      reg_close),
+                "overnight_info": _summary(sessions["overnight"], reg_close),
+                "regular_info":   _summary(reg),
+                "reg_close":      reg_close,
+                "trading_date":   sessions.get("trading_date", ""),
+                "source":         "Yahoo Finance" + (" (含延長時段)" if has_ext else " (僅正規盤)"),
+            })
             return result
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df = df.dropna(subset=["Close"])
-        df = _to_et(df)
 
-        sessions  = _split_sessions(df)
-        reg       = sessions["regular"]
-        reg_close = float(reg["Close"].iloc[-1]) if not reg.empty else None
+        elif resp.status_code == 429:
+            result["error"] = "Yahoo 請求過於頻繁，請稍後再試"
+        else:
+            result["error"] = f"Yahoo HTTP {resp.status_code}"
 
-        result.update({
-            "pre":            sessions["pre"],
-            "post":           sessions["post"],
-            "overnight":      sessions["overnight"],
-            "regular":        reg,
-            "pre_info":       _summary(sessions["pre"],       reg_close),
-            "post_info":      _summary(sessions["post"],      reg_close),
-            "overnight_info": _summary(sessions["overnight"], reg_close),
-            "regular_info":   _summary(reg),
-            "reg_close":      reg_close,
-            "trading_date":   sessions.get("trading_date",""),
-            "source":         "yfinance (可能延遲/不完整)",
-        })
     except Exception as e:
         result["error"] = str(e)
 
     return result
 
+
 def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_night: bool):
     """Render extended session panel with debug info."""
     if not any([show_pre, show_post, show_night]):
-        return
-
-    # ── Alpaca Key 設定 UI ─────────────────────────────────────────────────
-    alpaca_key = st.session_state.get("alpaca_api_key","")
-    try:
-        alpaca_key = alpaca_key or st.secrets.get("ALPACA_API_KEY","")
-    except Exception:
-        pass
-
-    if not alpaca_key:
-        st.markdown(
-            '<div class="ext-panel">'
-            '<div class="ext-title">🌙 延長時段（盤前/盤後）</div>'
-            '<div style="color:#ffcc00;font-size:0.88rem;margin-bottom:8px;">'
-            '⚙️ 需要 Alpaca API Key 才能取得實時盤前/盤後數據</div>'
-            '<div style="font-size:0.82rem;color:#7788aa;line-height:1.9;">'
-            '1. 前往 <b style="color:#aabbcc">alpaca.markets</b> 免費註冊（不需信用卡）<br>'
-            '2. 右上角 → Paper Trading → API Keys → Generate<br>'
-            '3. 複製 API Key ID 和 Secret Key 填入下方<br>'
-            '4. 或寫入 secrets.toml 永久保存'
-            '</div></div>',
-            unsafe_allow_html=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            k = st.text_input("Alpaca API Key ID", type="password",
-                              placeholder="PKxxxxxxxxxxxxxxxx",
-                              key=f"alpaca_key_input_{symbol}")
-        with c2:
-            s = st.text_input("Alpaca Secret Key", type="password",
-                              placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-                              key=f"alpaca_sec_input_{symbol}")
-        if k and s:
-            st.session_state["alpaca_api_key"]    = k.strip()
-            st.session_state["alpaca_secret_key"] = s.strip()
-            st.success("✅ Alpaca Key 已儲存")
-            st.rerun()
         return
 
     with st.spinner("載入延長時段數據..."):
@@ -1751,7 +1681,7 @@ def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_n
         night = ext.get("overnight", pd.DataFrame())
         reg_close = ext.get("reg_close")
         source = ext.get("source", "unknown")
-        src_color = "#00ee66" if "Alpaca" in source else "#ffcc00"
+        src_color = "#00ee66" if "Yahoo" in source else "#ffcc00"
         st.markdown(f'<span style="color:{src_color};font-size:0.82rem;">● 數據來源：{source}</span>', unsafe_allow_html=True)
         _rc_str = f"${reg_close:.2f}" if reg_close else "N/A"
         def _rng(d): return f"{str(d.index[0])[:16]} ~ {str(d.index[-1])[:16]}" if not d.empty else "-"
@@ -2133,7 +2063,7 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
         name="K線", showlegend=False,
     ), row=1, col=1)
 
-    # ── 盤前/盤後 K 線疊加（如有 Alpaca 數據）────────────────────────────
+    # ── 盤前/盤後 K 線疊加（Yahoo Finance 延長時段）───────────────────────
     if ext_data:
         _ext_sessions = [
             ("pre",       ext_data.get("pre",       pd.DataFrame()), "#3399ff", "#9944ff", "盤前"),
@@ -2511,7 +2441,7 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
     st.markdown('<div class="ema-bar">' + "".join(items) + '</div>',
                 unsafe_allow_html=True)
 
-    # 若有任何延長時段開啟，取得 Alpaca 數據傳給 build_chart
+    # 若有任何延長時段開啟，取得 Yahoo Finance 延長時段數據傳給 build_chart
     _ext_for_chart = None
     if show_pre or show_post or show_night:
         _ext_for_chart = fetch_extended_data(symbol)
