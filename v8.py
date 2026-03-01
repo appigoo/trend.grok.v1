@@ -1862,7 +1862,7 @@ def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_n
         ))
 
     if reg_close:
-        fig.add_hline(y=reg_close, line_dash="dot", line_color="#ffcc0066",
+        fig.add_hline(y=reg_close, line_dash="dot", line_color="rgba(255,204,0,0.4)",
                       line_width=1,
                       annotation_text=f"收盤 ${reg_close:.2f}",
                       annotation_font_color="#ffcc00", annotation_font_size=10)
