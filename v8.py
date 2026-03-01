@@ -1753,15 +1753,17 @@ def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_n
         source = ext.get("source", "unknown")
         src_color = "#00ee66" if "Alpaca" in source else "#ffcc00"
         st.markdown(f'<span style="color:{src_color};font-size:0.82rem;">● 數據來源：{source}</span>', unsafe_allow_html=True)
+        _rc_str = f"${reg_close:.2f}" if reg_close else "N/A"
+        def _rng(d): return f"{str(d.index[0])[:16]} ~ {str(d.index[-1])[:16]}" if not d.empty else "-"
         st.markdown(f"""
-**最後交易日：** `{trading_date}` | **正規盤收盤：** `${reg_close:.2f if reg_close else 'N/A'}`
+**最後交易日：** `{trading_date}` | **正規盤收盤：** `{_rc_str}`
 
 | 時段 | 數據根數 | 時間範圍 |
 |------|---------|---------|
-| 正規盤 | {len(reg)} | {str(reg.index[0])[:16] if not reg.empty else '-'} ~ {str(reg.index[-1])[:16] if not reg.empty else '-'} |
-| 盤前 | {len(pre)} | {str(pre.index[0])[:16] if not pre.empty else '-'} ~ {str(pre.index[-1])[:16] if not pre.empty else '-'} |
-| 盤後 | {len(post)} | {str(post.index[0])[:16] if not post.empty else '-'} ~ {str(post.index[-1])[:16] if not post.empty else '-'} |
-| 夜盤 | {len(night)} | {str(night.index[0])[:16] if not night.empty else '-'} ~ {str(night.index[-1])[:16] if not night.empty else '-'} |
+| 正規盤 | {len(reg)} | {_rng(reg)} |
+| 盤前 | {len(pre)} | {_rng(pre)} |
+| 盤後 | {len(post)} | {_rng(post)} |
+| 夜盤 | {len(night)} | {_rng(night)} |
 """)
 
     if ext.get("error"):
