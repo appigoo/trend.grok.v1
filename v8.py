@@ -1489,149 +1489,200 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
 # 延長時段數據（盤前 Pre-market / 盤後 After-hours / 夜盤）
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(ttl=60)   # 盤前盤後每分鐘更新
+@st.cache_data(ttl=60)
 def fetch_extended_data(symbol: str) -> dict:
     """
-    抓取盤前(pre)、盤後(post)、夜盤(overnight)數據
-    yfinance Ticker.history 支援 prepost=True 取得延長時段
-    回傳: {pre: df, post: df, regular: df, info: {...}}
+    Fetch pre-market, after-hours, overnight data using yfinance prepost=True.
+    Robustly finds the most recent trading day in the data (handles weekends/holidays).
+    Session times (US Eastern):
+      Pre-market : 04:00 - 09:29
+      Regular    : 09:30 - 15:59
+      After-hours: 16:00 - 19:59
+      Overnight  : 20:00 - 03:59 (spans midnight)
     """
-    from datetime import timezone, timedelta
-    import pytz
-
     result = {"pre": pd.DataFrame(), "post": pd.DataFrame(),
               "overnight": pd.DataFrame(), "regular": pd.DataFrame(),
-              "error": None}
+              "error": None, "reg_close": None,
+              "pre_info": None, "post_info": None,
+              "overnight_info": None, "regular_info": None}
     try:
-        t = yf.Ticker(symbol)
-        # 抓最近 5 天 1 分鐘數據，含盤前盤後
-        df = t.history(period="5d", interval="1m",
-                       prepost=True, auto_adjust=True)
+        # ── fetch 5 days 1-min with prepost ──────────────────────────────
+        t  = yf.Ticker(symbol)
+        df = t.history(period="5d", interval="1m", prepost=True, auto_adjust=True)
         if df.empty:
             result["error"] = "無數據"
             return result
 
+        # ── normalize columns ─────────────────────────────────────────────
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        df = df.dropna(subset=["Close"])
         df.index = pd.to_datetime(df.index)
-        # 統一轉成 US/Eastern 時區
-        eastern = pytz.timezone("America/New_York")
+
+        # ── convert to US/Eastern (handles DST automatically) ─────────────
+        try:
+            import pytz
+            eastern = pytz.timezone("America/New_York")
+        except ImportError:
+            from datetime import timezone as _tz
+            import datetime as _dt
+            eastern = _dt.timezone(_dt.timedelta(hours=-5))
+
         if df.index.tzinfo is None:
             df.index = df.index.tz_localize("UTC").tz_convert(eastern)
         else:
             df.index = df.index.tz_convert(eastern)
 
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df = df.dropna(subset=["Close"])
+        # ── find the most recent date that has REGULAR session data ───────
+        # Regular session = 09:30-16:00 ET
+        reg_mask_all = (
+            (df.index.hour > 9) |
+            ((df.index.hour == 9) & (df.index.minute >= 30))
+        ) & (df.index.hour < 16)
 
-        # 取最近一個交易日（美東時間）
-        today_et = pd.Timestamp.now(tz=eastern).normalize()
+        reg_dates = sorted(set(df.index[reg_mask_all].date), reverse=True)
+        if not reg_dates:
+            result["error"] = "找不到正規盤數據"
+            return result
 
-        def _session_df(df_all, hour_start, hour_end, date_et=None):
-            """篩選指定小時範圍（美東）"""
-            if date_et is None:
-                date_et = today_et
-            mask = (
-                (df_all.index.date == date_et.date()) &
-                (df_all.index.hour >= hour_start) &
-                (df_all.index.hour < hour_end)
-            )
-            return df_all[mask].copy()
+        last_trading_date = reg_dates[0]  # most recent day with regular session
 
-        # 正規盤：09:30–16:00
-        regular = _session_df(df, 9, 16)
-        # 盤前：04:00–09:30（含 4:00–9:29）
-        def _pre(df_all, date_et):
-            mask = (
-                (df_all.index.date == date_et.date()) &
+        # ── session splitters ──────────────────────────────────────────────
+        def _regular(date):
+            m = (
+                (df.index.date == date) &
                 (
-                    (df_all.index.hour >= 4) &
-                    ~((df_all.index.hour == 9) & (df_all.index.minute >= 30))
+                    (df.index.hour > 9) |
+                    ((df.index.hour == 9) & (df.index.minute >= 30))
+                ) &
+                (df.index.hour < 16)
+            )
+            return df[m].copy()
+
+        def _pre(date):
+            m = (
+                (df.index.date == date) &
+                (df.index.hour >= 4) &
+                (
+                    (df.index.hour < 9) |
+                    ((df.index.hour == 9) & (df.index.minute < 30))
                 )
             )
-            return df_all[mask].copy()
-        # 盤後：16:00–20:00
-        post = _session_df(df, 16, 20)
-        # 夜盤/前一夜：20:00–04:00（跨日）
-        yesterday_et = today_et - pd.Timedelta(days=1)
-        night_mask = (
-            (
-                (df.index.date == today_et.date()) &
-                (df.index.hour < 4)
-            ) | (
-                (df.index.date == yesterday_et.date()) &
-                (df.index.hour >= 20)
+            return df[m].copy()
+
+        def _post(date):
+            m = (
+                (df.index.date == date) &
+                (df.index.hour >= 16) &
+                (df.index.hour < 20)
             )
-        )
-        overnight = df[night_mask].copy()
+            return df[m].copy()
 
-        pre = _pre(df, today_et)
+        def _overnight(reg_date):
+            """20:00 on reg_date through 03:59 on next calendar day"""
+            import datetime as _dt
+            next_date = reg_date + _dt.timedelta(days=1)
+            m = (
+                ((df.index.date == reg_date) & (df.index.hour >= 20)) |
+                ((df.index.date == next_date) & (df.index.hour < 4))
+            )
+            return df[m].copy()
 
-        # 若當天盤前沒有 → 用前一日盤前
-        if pre.empty:
-            pre = _pre(df, yesterday_et)
-        if regular.empty:
-            regular = _session_df(df, 9, 16, yesterday_et)
-        if post.empty:
-            post = _session_df(df, 16, 20, yesterday_et)
+        # ── build sessions for last trading day ───────────────────────────
+        regular   = _regular(last_trading_date)
+        pre       = _pre(last_trading_date)
+        post      = _post(last_trading_date)
+        overnight = _overnight(last_trading_date)
 
-        def _summary(session_df, ref_close=None):
-            if session_df.empty:
-                return None
-            first = float(session_df["Close"].iloc[0])
-            last  = float(session_df["Close"].iloc[-1])
-            hi    = float(session_df["High"].max())
-            lo    = float(session_df["Low"].min())
-            vol   = int(session_df["Volume"].sum())
-            chg   = last - (ref_close or first)
-            pct   = chg / (ref_close or first) * 100 if (ref_close or first) else 0
-            return {"open": first, "close": last, "high": hi, "low": lo,
-                    "volume": vol, "chg": chg, "pct": pct,
-                    "bars": len(session_df)}
+        # If pre/post empty, try previous trading day
+        if pre.empty and len(reg_dates) > 1:
+            pre = _pre(reg_dates[1])
+        if post.empty and len(reg_dates) > 1:
+            post = _post(reg_dates[1])
 
         reg_close = float(regular["Close"].iloc[-1]) if not regular.empty else None
 
+        def _summary(sdf, ref=None):
+            if sdf.empty:
+                return None
+            ref = ref or float(sdf["Close"].iloc[0])
+            last = float(sdf["Close"].iloc[-1])
+            return {
+                "open":  float(sdf["Close"].iloc[0]),
+                "close": last,
+                "high":  float(sdf["High"].max()),
+                "low":   float(sdf["Low"].min()),
+                "volume": int(sdf["Volume"].sum()),
+                "chg":   last - ref,
+                "pct":   (last - ref) / ref * 100 if ref else 0,
+                "bars":  len(sdf),
+                "date":  str(sdf.index[-1].date()),
+            }
+
         result.update({
-            "pre":       pre,
-            "post":      post,
-            "overnight": overnight,
-            "regular":   regular,
-            "pre_info":       _summary(pre, reg_close),
-            "post_info":      _summary(post, reg_close),
+            "pre":            pre,
+            "post":           post,
+            "overnight":      overnight,
+            "regular":        regular,
+            "pre_info":       _summary(pre,       reg_close),
+            "post_info":      _summary(post,      reg_close),
             "overnight_info": _summary(overnight, reg_close),
             "regular_info":   _summary(regular),
             "reg_close":      reg_close,
+            "trading_date":   str(last_trading_date),
         })
+
     except Exception as e:
-        result["error"] = str(e)
+        import traceback
+        result["error"] = f"{e} | {traceback.format_exc()[-200:]}"
     return result
 
 
 def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_night: bool):
-    """渲染延長時段面板：盤前 / 盤後 / 夜盤 K 線 + 摘要"""
+    """Render extended session panel with debug info."""
     if not any([show_pre, show_post, show_night]):
         return
 
     with st.spinner("載入延長時段數據..."):
         ext = fetch_extended_data(symbol)
 
+    # Always show debug expander so user can diagnose issues
+    with st.expander("🔍 延長時段診斷（點擊展開）", expanded=ext.get("error") is not None):
+        if ext.get("error"):
+            st.error(f"錯誤：{ext['error']}")
+        trading_date = ext.get("trading_date", "?")
+        reg = ext.get("regular", pd.DataFrame())
+        pre = ext.get("pre", pd.DataFrame())
+        post = ext.get("post", pd.DataFrame())
+        night = ext.get("overnight", pd.DataFrame())
+        reg_close = ext.get("reg_close")
+        st.markdown(f"""
+**最後交易日：** `{trading_date}` | **正規盤收盤：** `${reg_close:.2f if reg_close else 'N/A'}`
+
+| 時段 | 數據根數 | 時間範圍 |
+|------|---------|---------|
+| 正規盤 | {len(reg)} | {str(reg.index[0])[:16] if not reg.empty else '-'} ~ {str(reg.index[-1])[:16] if not reg.empty else '-'} |
+| 盤前 | {len(pre)} | {str(pre.index[0])[:16] if not pre.empty else '-'} ~ {str(pre.index[-1])[:16] if not pre.empty else '-'} |
+| 盤後 | {len(post)} | {str(post.index[0])[:16] if not post.empty else '-'} ~ {str(post.index[-1])[:16] if not post.empty else '-'} |
+| 夜盤 | {len(night)} | {str(night.index[0])[:16] if not night.empty else '-'} ~ {str(night.index[-1])[:16] if not night.empty else '-'} |
+""")
+
     if ext.get("error"):
-        st.warning(f"延長時段數據載入失敗：{ext['error']}")
         return
 
+    reg_close = ext.get("reg_close")
     st.markdown(
-        '<div class="ext-panel"><div class="ext-title">🌙 延長時段</div>',
+        f'<div class="ext-panel">'
+        f'<div class="ext-title">🌙 延長時段 · {ext.get("trading_date","")}</div>',
         unsafe_allow_html=True)
 
-    # ── 摘要卡片行 ───────────────────────────────────────────────────────────
-    reg_close = ext.get("reg_close")
-    stat_parts = []
-
+    # ── 摘要卡片 ─────────────────────────────────────────────────────────────
     session_cfg = [
-        ("pre",       show_pre,   "盤前", "ext-tag-pre",   "📈"),
-        ("post",      show_post,  "盤後", "ext-tag-post",  "📉"),
-        ("overnight", show_night, "夜盤", "ext-tag-night", "🌙"),
+        ("pre",       show_pre,   "盤前 04:00-09:30", "ext-tag-pre"),
+        ("post",      show_post,  "盤後 16:00-20:00", "ext-tag-post"),
+        ("overnight", show_night, "夜盤 20:00-04:00", "ext-tag-night"),
     ]
-
-    for key, enabled, name, tag_cls, icon in session_cfg:
+    stat_parts = []
+    for key, enabled, name, tag_cls in session_cfg:
         if not enabled:
             continue
         info = ext.get(f"{key}_info")
@@ -1651,86 +1702,54 @@ def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_n
             f'<div class="ext-stat-val">${info["close"]:.2f}</div>'
             f'<div class="{chg_cls}">{arrow} {info["chg"]:+.2f} ({info["pct"]:+.2f}%)</div>'
             f'<div style="font-size:0.68rem;color:#334455;margin-top:3px;">'
-            f'H:{info["high"]:.2f}　L:{info["low"]:.2f}　{info["bars"]}根</div>'
+            f'H:{info["high"]:.2f} L:{info["low"]:.2f} · {info["bars"]}根 · {info.get("date","")}</div>'
             f'</div>'
         )
-
     if stat_parts:
-        st.markdown(
-            '<div class="ext-stat-row">' + "".join(stat_parts) + '</div>',
-            unsafe_allow_html=True)
+        st.markdown('<div class="ext-stat-row">' + "".join(stat_parts) + '</div>',
+                    unsafe_allow_html=True)
 
-    # ── 合併圖表：正規盤 + 選擇的延長時段 ─────────────────────────────────
-    frames_to_plot = []
-    colors_map = {}
+    # ── K 線圖 ────────────────────────────────────────────────────────────────
+    session_meta = {
+        "regular":   ("正規盤",  "#00cc44", "#ff4444"),
+        "pre":       ("盤前",    "#44aaff", "#aa44ff"),
+        "post":      ("盤後",    "#00aacc", "#cc6600"),
+        "overnight": ("夜盤",    "#00bbbb", "#886600"),
+    }
+    plot_order = [
+        ("overnight", show_night, ext.get("overnight", pd.DataFrame())),
+        ("pre",       show_pre,   ext.get("pre",       pd.DataFrame())),
+        ("regular",   True,       ext.get("regular",   pd.DataFrame())),
+        ("post",      show_post,  ext.get("post",      pd.DataFrame())),
+    ]
 
-    if not ext["regular"].empty:
-        regular_plot = ext["regular"].copy()
-        regular_plot["_session"] = "regular"
-        frames_to_plot.append(regular_plot)
+    # Collect all timestamps in chronological order for category axis
+    all_frames = []
+    for sess, enabled, df_s in plot_order:
+        if enabled and not df_s.empty:
+            tmp = df_s[["Open","High","Low","Close","Volume"]].copy()
+            tmp["_sess"] = sess
+            all_frames.append(tmp)
 
-    if show_pre and not ext["pre"].empty:
-        pre_plot = ext["pre"].copy()
-        pre_plot["_session"] = "pre"
-        frames_to_plot.append(pre_plot)
-
-    if show_post and not ext["post"].empty:
-        post_plot = ext["post"].copy()
-        post_plot["_session"] = "post"
-        frames_to_plot.append(post_plot)
-
-    if show_night and not ext["overnight"].empty:
-        night_plot = ext["overnight"].copy()
-        night_plot["_session"] = "overnight"
-        frames_to_plot.append(night_plot)
-
-    if not frames_to_plot:
+    if not all_frames:
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    combined = pd.concat(frames_to_plot).sort_index()
+    combined = pd.concat(all_frames).sort_index()
+    fmt      = "%m/%d %H:%M"
+    # de-duplicate timestamps (just in case)
+    combined = combined[~combined.index.duplicated(keep="last")]
+    xlabels  = [t.strftime(fmt) for t in combined.index]
 
-    # 轉成 category x-axis（消除休市空白）
-    fmt = "%m/%d %H:%M"
-    xlabels = [t.strftime(fmt) for t in combined.index]
-
-    # 決定 K 線顏色（正規盤標準色，延長時段稍淡）
-    def _candle_colors(df_slice, session):
-        ups   = df_slice["Close"] >= df_slice["Open"]
-        if session == "regular":
-            c_up, c_dn = "#00cc44", "#ff4444"
-        elif session == "pre":
-            c_up, c_dn = "#44aaff", "#aa44ff"   # 藍/紫（盤前）
-        elif session == "post":
-            c_up, c_dn = "#00aacc", "#cc6600"   # 青/橘（盤後）
-        else:
-            c_up, c_dn = "#008888", "#884400"   # 深青/深橘（夜盤）
-        return [c_up if u else c_dn for u in ups]
-
-    # 用 OHLC bar 而不是 Candlestick（支援 marker_color per-bar）
-    # 分 session 分別畫 Candlestick trace
     fig = go.Figure()
-
-    session_meta = {
-        "regular": ("正規盤", "#00cc44", "#ff4444"),
-        "pre":     ("盤前",   "#44aaff", "#aa44ff"),
-        "post":    ("盤後",   "#00aacc", "#cc6600"),
-        "overnight":("夜盤",  "#00bbbb", "#886600"),
-    }
-
-    # 為每個 session 建一條 Candlestick trace
-    plotted_sessions = combined["_session"].unique() if "_session" in combined.columns else []
-    x_all = xlabels  # 全部 x 軸用 combined 的 label
-
-    for sess in ["overnight", "pre", "regular", "post"]:
-        if sess not in plotted_sessions:
+    for sess, enabled, _ in plot_order:
+        if not enabled:
             continue
-        mask = combined["_session"] == sess
-        idx_list = [i for i, m in enumerate(mask) if m]
-        if not idx_list:
+        mask = combined["_sess"] == sess
+        sub  = combined[mask]
+        if sub.empty:
             continue
-        xs  = [xlabels[i] for i in idx_list]
-        sub = combined[mask]
+        xs          = [t.strftime(fmt) for t in sub.index]
         name_, c_up, c_dn = session_meta[sess]
         fig.add_trace(go.Candlestick(
             x=xs,
@@ -1739,20 +1758,18 @@ def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_n
             name=name_,
             increasing_line_color=c_up, increasing_fillcolor=c_up,
             decreasing_line_color=c_dn, decreasing_fillcolor=c_dn,
+            line=dict(width=1),
         ))
 
-    # 正規收盤參考線
     if reg_close:
-        fig.add_hline(
-            y=reg_close, line_dash="dot", line_color="#ffcc0066",
-            line_width=1,
-            annotation_text=f"收盤 ${reg_close:.2f}",
-            annotation_font_color="#ffcc00",
-            annotation_font_size=10,
-        )
+        fig.add_hline(y=reg_close, line_dash="dot", line_color="#ffcc0066",
+                      line_width=1,
+                      annotation_text=f"收盤 ${reg_close:.2f}",
+                      annotation_font_color="#ffcc00", annotation_font_size=10)
 
+    step = max(1, len(xlabels) // 12)
     fig.update_layout(
-        height=320,
+        height=340,
         paper_bgcolor="#0a0e18", plot_bgcolor="#0a0e18",
         font=dict(color="#aabbcc", size=10),
         margin=dict(l=0, r=0, t=30, b=0),
@@ -1760,43 +1777,31 @@ def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_n
                     bgcolor="rgba(0,0,0,0)", font_size=10),
         xaxis=dict(
             type="category",
+            tickmode="array",
+            tickvals=xlabels[::step],
+            ticktext=xlabels[::step],
             tickangle=-35,
             tickfont=dict(size=8, color="#556688"),
-            gridcolor="#151c2e", showgrid=True,
+            gridcolor="#151c2e",
             rangeslider=dict(visible=False),
         ),
-        yaxis=dict(
-            tickfont=dict(size=9, color="#556688"),
-            gridcolor="#151c2e", showgrid=True,
-            side="right",
-        ),
-    )
-
-    # Category axis + 每 N 個 tick 顯示一個
-    n_labels = len(xlabels)
-    step = max(1, n_labels // 10)
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=xlabels[::step],
-        ticktext=xlabels[::step],
+        yaxis=dict(side="right", gridcolor="#151c2e",
+                   tickfont=dict(size=9, color="#556688")),
     )
 
     st.plotly_chart(fig, use_container_width=True,
-                    config={"displayModeBar": False},
+                    config={"displayModeBar": True},
                     key=f"ext_{symbol}")
 
-    # 色例說明
-    legend_html = (
-        '<div style="font-size:0.72rem;color:#445566;margin-top:4px;display:flex;gap:12px;">'
-        '<span style="color:#44aaff">■ 盤前</span>'
-        '<span style="color:#00cc44">■ 正規盤↑</span>'
-        '<span style="color:#ff4444">■ 正規盤↓</span>'
-        '<span style="color:#00aacc">■ 盤後</span>'
+    st.markdown(
+        '<div style="font-size:0.72rem;color:#445566;display:flex;gap:12px;margin-top:4px;">'
+        '<span style="color:#44aaff">■ 盤前(藍)</span>'
+        '<span style="color:#00cc44">■ 正規↑(綠)</span>'
+        '<span style="color:#ff4444">■ 正規↓(紅)</span>'
+        '<span style="color:#00aacc">■ 盤後(青)</span>'
         '<span style="color:#00bbbb">■ 夜盤</span>'
-        '</div>'
-    )
-    st.markdown(legend_html + '</div>', unsafe_allow_html=True)
-
+        '</div></div>',
+        unsafe_allow_html=True)
 
 def fetch_data(symbol: str, interval: str) -> pd.DataFrame:
     _, period = INTERVAL_MAP[interval]
