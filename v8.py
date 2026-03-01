@@ -1,3 +1,4 @@
+#Grok v8.1
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -193,54 +194,6 @@ st.markdown("""
     }
     @keyframes ai-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
     .ai-loading-dot { animation: ai-pulse 1.2s infinite; }
-
-    /* 延長時段面板 */
-    .ext-panel {
-        background:#0e1020; border-radius:12px; padding:16px 18px;
-        border:1px solid #1e2040; margin:10px 0;
-    }
-    .ext-title {
-        font-size:1rem; font-weight:700; color:#88aadd;
-        letter-spacing:0.04em; margin-bottom:12px;
-        display:flex; align-items:center; gap:8px;
-    }
-    .ext-toggle-row {
-        display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; align-items:center;
-    }
-    /* iOS 風格 toggle */
-    .ext-toggle {
-        display:inline-flex; align-items:center; gap:8px;
-        background:#141c2e; border:1px solid #2a3050;
-        border-radius:20px; padding:5px 12px 5px 6px;
-        cursor:pointer; user-select:none; font-size:0.82rem; color:#7799bb;
-        transition:all 0.2s;
-    }
-    .ext-toggle.active {
-        background:#0d2040; border-color:#3366aa; color:#66aaff;
-    }
-    .ext-toggle-dot {
-        width:18px; height:18px; border-radius:50%; background:#334466;
-        display:inline-block; transition:background 0.2s;
-    }
-    .ext-toggle.active .ext-toggle-dot { background:#4488ff; }
-    /* 時段標籤 */
-    .ext-session-tag {
-        display:inline-block; font-size:0.72rem; font-weight:700;
-        padding:2px 8px; border-radius:10px; margin-right:4px;
-    }
-    .ext-tag-pre  { background:#0d2040; color:#44aaff; border:1px solid #224488; }
-    .ext-tag-post { background:#1a1040; color:#aa88ff; border:1px solid #442288; }
-    .ext-tag-night{ background:#001830; color:#00ccff; border:1px solid #004466; }
-    /* 延長時段摘要卡片 */
-    .ext-stat-row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
-    .ext-stat-card {
-        flex:1; min-width:90px; background:#141c2e; border-radius:8px;
-        padding:8px 12px; border:1px solid #1e2e48; text-align:center;
-    }
-    .ext-stat-label { font-size:0.7rem; color:#5577aa; margin-bottom:3px; }
-    .ext-stat-val   { font-size:1rem; font-weight:700; color:#ccd6ee; }
-    .ext-stat-chg-up{ font-size:0.75rem; color:#00ee66; }
-    .ext-stat-chg-dn{ font-size:0.75rem; color:#ff5566; }
 
     /* 社群情緒面板 */
     .social-panel {
@@ -1485,354 +1438,6 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
 # 數據抓取
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=60)
-# ══════════════════════════════════════════════════════════════════════════════
-# 延長時段數據（盤前 Pre-market / 盤後 After-hours / 夜盤）
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=60)
-def fetch_extended_data(symbol: str) -> dict:
-    """
-    Fetch pre/post/overnight bars via Yahoo Finance chart API.
-    No API key needed. Uses the same endpoint as Yahoo Finance website.
-    Extended hours data available via includePrePost=True parameter.
-    """
-    result = {
-        "pre": pd.DataFrame(), "post": pd.DataFrame(),
-        "overnight": pd.DataFrame(), "regular": pd.DataFrame(),
-        "error": None, "reg_close": None,
-        "pre_info": None, "post_info": None,
-        "overnight_info": None, "regular_info": None,
-        "source": "none", "trading_date": "",
-    }
-
-    def _to_et(df):
-        try:
-            import pytz
-            et = pytz.timezone("America/New_York")
-        except ImportError:
-            import datetime as _dt
-            et = _dt.timezone(_dt.timedelta(hours=-5))
-        if df.index.tzinfo is None:
-            return df.tz_localize("UTC").tz_convert(et)
-        return df.tz_convert(et)
-
-    def _split_sessions(df_et):
-        if df_et.empty:
-            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight","trading_date"]}
-
-        def _reg(d):
-            m = ((df_et.index.date == d) &
-                 ((df_et.index.hour > 9) |
-                  ((df_et.index.hour == 9) & (df_et.index.minute >= 30))) &
-                 (df_et.index.hour < 16))
-            return df_et[m].copy()
-
-        def _pre(d):
-            m = ((df_et.index.date == d) &
-                 (df_et.index.hour >= 4) &
-                 ((df_et.index.hour < 9) |
-                  ((df_et.index.hour == 9) & (df_et.index.minute < 30))))
-            return df_et[m].copy()
-
-        def _post(d):
-            m = ((df_et.index.date == d) &
-                 (df_et.index.hour >= 16) & (df_et.index.hour < 20))
-            return df_et[m].copy()
-
-        def _night(d):
-            import datetime as _dt
-            nd = d + _dt.timedelta(days=1)
-            m = (((df_et.index.date == d)  & (df_et.index.hour >= 20)) |
-                 ((df_et.index.date == nd) & (df_et.index.hour <  4)))
-            return df_et[m].copy()
-
-        # Find most recent day with regular session bars
-        reg_mask = (
-            ((df_et.index.hour > 9) |
-             ((df_et.index.hour == 9) & (df_et.index.minute >= 30))) &
-            (df_et.index.hour < 16)
-        )
-        dates = sorted(set(df_et.index[reg_mask].date), reverse=True)
-        if not dates:
-            return {k: pd.DataFrame() for k in ["regular","pre","post","overnight","trading_date"]}
-
-        d0  = dates[0]
-        reg = _reg(d0)
-        pre = _pre(d0)
-        post  = _post(d0)
-        night = _night(d0)
-        if pre.empty   and len(dates) > 1: pre   = _pre(dates[1])
-        if post.empty  and len(dates) > 1: post  = _post(dates[1])
-        if night.empty and len(dates) > 1: night = _night(dates[1])
-
-        return {"regular": reg, "pre": pre, "post": post,
-                "overnight": night, "trading_date": str(d0)}
-
-    def _summary(sdf, ref=None):
-        if sdf.empty:
-            return None
-        ref  = ref or float(sdf["Close"].iloc[0])
-        last = float(sdf["Close"].iloc[-1])
-        return {
-            "open":   float(sdf["Close"].iloc[0]),
-            "close":  last,
-            "high":   float(sdf["High"].max()),
-            "low":    float(sdf["Low"].min()),
-            "volume": int(sdf["Volume"].sum()),
-            "chg":    last - ref,
-            "pct":    (last - ref) / ref * 100 if ref else 0,
-            "bars":   len(sdf),
-            "date":   str(sdf.index[-1].date()),
-        }
-
-    # ── Yahoo Finance Chart API (no key needed) ───────────────────────────────
-    # Interval 1m with range 5d + includePrePost=True
-    try:
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-            f"?interval=1m&range=5d&includePrePost=true"
-            f"&events=div%2Csplits&corsDomain=finance.yahoo.com"
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/122.0 Safari/537.36",
-            "Accept": "application/json",
-            "Referer": "https://finance.yahoo.com",
-        }
-        resp = requests.get(url, headers=headers, timeout=15)
-
-        if resp.status_code == 200:
-            data   = resp.json()
-            chart  = data.get("chart", {})
-            result_data = chart.get("result", [])
-            if not result_data:
-                err = chart.get("error", {})
-                result["error"] = f"Yahoo 無數據: {err}"
-                return result
-
-            r          = result_data[0]
-            timestamps = r.get("timestamp", [])
-            quotes     = r.get("indicators", {}).get("quote", [{}])[0]
-
-            if not timestamps:
-                result["error"] = "Yahoo 回傳空時間序列"
-                return result
-
-            df = pd.DataFrame({
-                "Open":   quotes.get("open",   [None]*len(timestamps)),
-                "High":   quotes.get("high",   [None]*len(timestamps)),
-                "Low":    quotes.get("low",    [None]*len(timestamps)),
-                "Close":  quotes.get("close",  [None]*len(timestamps)),
-                "Volume": quotes.get("volume", [0]*len(timestamps)),
-            }, index=pd.to_datetime(timestamps, unit="s", utc=True))
-
-            df = _to_et(df)
-            df = df.dropna(subset=["Close"])
-            df["Volume"] = df["Volume"].fillna(0).astype(int)
-
-            sessions  = _split_sessions(df)
-            reg       = sessions["regular"]
-            reg_close = float(reg["Close"].iloc[-1]) if not reg.empty else None
-
-            has_ext = not sessions["pre"].empty or not sessions["post"].empty
-            result.update({
-                "pre":            sessions["pre"],
-                "post":           sessions["post"],
-                "overnight":      sessions["overnight"],
-                "regular":        reg,
-                "pre_info":       _summary(sessions["pre"],       reg_close),
-                "post_info":      _summary(sessions["post"],      reg_close),
-                "overnight_info": _summary(sessions["overnight"], reg_close),
-                "regular_info":   _summary(reg),
-                "reg_close":      reg_close,
-                "trading_date":   sessions.get("trading_date", ""),
-                "source":         "Yahoo Finance" + (" (含延長時段)" if has_ext else " (僅正規盤)"),
-            })
-            return result
-
-        elif resp.status_code == 429:
-            result["error"] = "Yahoo 請求過於頻繁，請稍後再試"
-        else:
-            result["error"] = f"Yahoo HTTP {resp.status_code}"
-
-    except Exception as e:
-        result["error"] = str(e)
-
-    return result
-
-
-def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_night: bool):
-    """Render extended session panel with debug info."""
-    if not any([show_pre, show_post, show_night]):
-        return
-
-    with st.spinner("載入延長時段數據..."):
-        ext = fetch_extended_data(symbol)
-
-    # Always show debug expander so user can diagnose issues
-    with st.expander("🔍 延長時段診斷（點擊展開）", expanded=ext.get("error") is not None):
-        if ext.get("error"):
-            st.error(f"錯誤：{ext['error']}")
-        trading_date = ext.get("trading_date", "?")
-        reg = ext.get("regular", pd.DataFrame())
-        pre = ext.get("pre", pd.DataFrame())
-        post = ext.get("post", pd.DataFrame())
-        night = ext.get("overnight", pd.DataFrame())
-        reg_close = ext.get("reg_close")
-        source = ext.get("source", "unknown")
-        src_color = "#00ee66" if "Yahoo" in source else "#ffcc00"
-        st.markdown(f'<span style="color:{src_color};font-size:0.82rem;">● 數據來源：{source}</span>', unsafe_allow_html=True)
-        _rc_str = f"${reg_close:.2f}" if reg_close else "N/A"
-        def _rng(d): return f"{str(d.index[0])[:16]} ~ {str(d.index[-1])[:16]}" if not d.empty else "-"
-        st.markdown(f"""
-**最後交易日：** `{trading_date}` | **正規盤收盤：** `{_rc_str}`
-
-| 時段 | 數據根數 | 時間範圍 |
-|------|---------|---------|
-| 正規盤 | {len(reg)} | {_rng(reg)} |
-| 盤前 | {len(pre)} | {_rng(pre)} |
-| 盤後 | {len(post)} | {_rng(post)} |
-| 夜盤 | {len(night)} | {_rng(night)} |
-""")
-
-    if ext.get("error"):
-        return
-
-    reg_close = ext.get("reg_close")
-    st.markdown(
-        f'<div class="ext-panel">'
-        f'<div class="ext-title">🌙 延長時段 · {ext.get("trading_date","")}</div>',
-        unsafe_allow_html=True)
-
-    # ── 摘要卡片 ─────────────────────────────────────────────────────────────
-    session_cfg = [
-        ("pre",       show_pre,   "盤前 04:00-09:30", "ext-tag-pre"),
-        ("post",      show_post,  "盤後 16:00-20:00", "ext-tag-post"),
-        ("overnight", show_night, "夜盤 20:00-04:00", "ext-tag-night"),
-    ]
-    stat_parts = []
-    for key, enabled, name, tag_cls in session_cfg:
-        if not enabled:
-            continue
-        info = ext.get(f"{key}_info")
-        if not info:
-            stat_parts.append(
-                f'<div class="ext-stat-card">'
-                f'<div class="ext-stat-label"><span class="ext-session-tag {tag_cls}">{name}</span></div>'
-                f'<div class="ext-stat-val" style="color:#445566;">無數據</div>'
-                f'</div>'
-            )
-            continue
-        chg_cls = "ext-stat-chg-up" if info["chg"] >= 0 else "ext-stat-chg-dn"
-        arrow   = "▲" if info["chg"] >= 0 else "▼"
-        stat_parts.append(
-            f'<div class="ext-stat-card">'
-            f'<div class="ext-stat-label"><span class="ext-session-tag {tag_cls}">{name}</span></div>'
-            f'<div class="ext-stat-val">${info["close"]:.2f}</div>'
-            f'<div class="{chg_cls}">{arrow} {info["chg"]:+.2f} ({info["pct"]:+.2f}%)</div>'
-            f'<div style="font-size:0.68rem;color:#334455;margin-top:3px;">'
-            f'H:{info["high"]:.2f} L:{info["low"]:.2f} · {info["bars"]}根 · {info.get("date","")}</div>'
-            f'</div>'
-        )
-    if stat_parts:
-        st.markdown('<div class="ext-stat-row">' + "".join(stat_parts) + '</div>',
-                    unsafe_allow_html=True)
-
-    # ── K 線圖 ────────────────────────────────────────────────────────────────
-    session_meta = {
-        "regular":   ("正規盤",  "#00cc44", "#ff4444"),
-        "pre":       ("盤前",    "#44aaff", "#aa44ff"),
-        "post":      ("盤後",    "#00aacc", "#cc6600"),
-        "overnight": ("夜盤",    "#00bbbb", "#886600"),
-    }
-    plot_order = [
-        ("overnight", show_night, ext.get("overnight", pd.DataFrame())),
-        ("pre",       show_pre,   ext.get("pre",       pd.DataFrame())),
-        ("regular",   True,       ext.get("regular",   pd.DataFrame())),
-        ("post",      show_post,  ext.get("post",      pd.DataFrame())),
-    ]
-
-    # Collect all timestamps in chronological order for category axis
-    all_frames = []
-    for sess, enabled, df_s in plot_order:
-        if enabled and not df_s.empty:
-            tmp = df_s[["Open","High","Low","Close","Volume"]].copy()
-            tmp["_sess"] = sess
-            all_frames.append(tmp)
-
-    if not all_frames:
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
-    combined = pd.concat(all_frames).sort_index()
-    fmt      = "%m/%d %H:%M"
-    # de-duplicate timestamps (just in case)
-    combined = combined[~combined.index.duplicated(keep="last")]
-    xlabels  = [t.strftime(fmt) for t in combined.index]
-
-    fig = go.Figure()
-    for sess, enabled, _ in plot_order:
-        if not enabled:
-            continue
-        mask = combined["_sess"] == sess
-        sub  = combined[mask]
-        if sub.empty:
-            continue
-        xs          = [t.strftime(fmt) for t in sub.index]
-        name_, c_up, c_dn = session_meta[sess]
-        fig.add_trace(go.Candlestick(
-            x=xs,
-            open=sub["Open"], high=sub["High"],
-            low=sub["Low"],   close=sub["Close"],
-            name=name_,
-            increasing_line_color=c_up, increasing_fillcolor=c_up,
-            decreasing_line_color=c_dn, decreasing_fillcolor=c_dn,
-            line=dict(width=1),
-        ))
-
-    if reg_close:
-        fig.add_hline(y=reg_close, line_dash="dot", line_color="rgba(255,204,0,0.4)",
-                      line_width=1,
-                      annotation_text=f"收盤 ${reg_close:.2f}",
-                      annotation_font_color="#ffcc00", annotation_font_size=10)
-
-    step = max(1, len(xlabels) // 12)
-    fig.update_layout(
-        height=340,
-        paper_bgcolor="#0a0e18", plot_bgcolor="#0a0e18",
-        font=dict(color="#aabbcc", size=10),
-        margin=dict(l=0, r=0, t=30, b=0),
-        legend=dict(orientation="h", y=1.08, x=0,
-                    bgcolor="rgba(0,0,0,0)", font_size=10),
-        xaxis=dict(
-            type="category",
-            tickmode="array",
-            tickvals=xlabels[::step],
-            ticktext=xlabels[::step],
-            tickangle=-35,
-            tickfont=dict(size=8, color="#556688"),
-            gridcolor="#151c2e",
-            rangeslider=dict(visible=False),
-        ),
-        yaxis=dict(side="right", gridcolor="#151c2e",
-                   tickfont=dict(size=9, color="#556688")),
-    )
-
-    st.plotly_chart(fig, use_container_width=True,
-                    config={"displayModeBar": True},
-                    key=f"ext_{symbol}")
-
-    st.markdown(
-        '<div style="font-size:0.72rem;color:#445566;display:flex;gap:12px;margin-top:4px;">'
-        '<span style="color:#44aaff">■ 盤前(藍)</span>'
-        '<span style="color:#00cc44">■ 正規↑(綠)</span>'
-        '<span style="color:#ff4444">■ 正規↓(紅)</span>'
-        '<span style="color:#00aacc">■ 盤後(青)</span>'
-        '<span style="color:#00bbbb">■ 夜盤</span>'
-        '</div></div>',
-        unsafe_allow_html=True)
-
 def fetch_data(symbol: str, interval: str) -> pd.DataFrame:
     _, period = INTERVAL_MAP[interval]
     try:
@@ -2012,7 +1617,7 @@ def run_alerts(symbol, period_label, df, trigger_ai=False, mkt=None):
 # ══════════════════════════════════════════════════════════════════════════════
 # 建立 K 線圖
 # ══════════════════════════════════════════════════════════════════════════════
-def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data=None):
+def build_chart(symbol, df, interval_label, compact=False, max_bars=90):
     if df.empty: return None
 
     # ── 限制最多顯示 90 根 K 線，避免圖表擁擠 ──
@@ -2062,34 +1667,6 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90, ext_data
         decreasing_line_color="#ff4444", decreasing_fillcolor="#ff4444",
         name="K線", showlegend=False,
     ), row=1, col=1)
-
-    # ── 盤前/盤後 K 線疊加（Yahoo Finance 延長時段）───────────────────────
-    if ext_data:
-        _ext_sessions = [
-            ("pre",       ext_data.get("pre",       pd.DataFrame()), "#3399ff", "#9944ff", "盤前"),
-            ("post",      ext_data.get("post",      pd.DataFrame()), "#00ccaa", "#cc8800", "盤後"),
-            ("overnight", ext_data.get("overnight", pd.DataFrame()), "#00aaaa", "#886600", "夜盤"),
-        ]
-        for _sess_key, _sdf, _cup, _cdn, _sname in _ext_sessions:
-            if _sdf.empty:
-                continue
-            # Align to same fmt string labels
-            _sdf = _sdf.copy()
-            _sdf.index = pd.to_datetime(_sdf.index)
-            _xlbl = [t.strftime(fmt) for t in _sdf.index]
-            _cols = [c[0] if isinstance(c, tuple) else c for c in _sdf.columns]
-            _sdf.columns = _cols
-            if not all(c in _sdf.columns for c in ["Open","High","Low","Close"]):
-                continue
-            fig.add_trace(go.Candlestick(
-                x=_xlbl,
-                open=_sdf["Open"], high=_sdf["High"],
-                low=_sdf["Low"],   close=_sdf["Close"],
-                name=_sname,
-                increasing_line_color=_cup, increasing_fillcolor=_cup,
-                decreasing_line_color=_cdn, decreasing_fillcolor=_cdn,
-                line=dict(width=0.8), opacity=0.85,
-            ), row=1, col=1)
 
     # EMA 線
     for n, color in EMA_CONFIGS:
@@ -2399,7 +1976,7 @@ def render_mtf_charts(symbol, selected_intervals, layout_mode, max_bars=90):
 # ══════════════════════════════════════════════════════════════════════════════
 # 單週期渲染
 # ══════════════════════════════════════════════════════════════════════════════
-def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, show_post=False, show_night=False):
+def render_single(symbol, interval, show_alerts, max_bars=90):
     label, _ = INTERVAL_MAP[interval]
     with st.spinner(f"載入 {symbol} {label} 數據中..."):
         df = fetch_data(symbol, interval)
@@ -2441,12 +2018,7 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
     st.markdown('<div class="ema-bar">' + "".join(items) + '</div>',
                 unsafe_allow_html=True)
 
-    # 若有任何延長時段開啟，取得 Yahoo Finance 延長時段數據傳給 build_chart
-    _ext_for_chart = None
-    if show_pre or show_post or show_night:
-        _ext_for_chart = fetch_extended_data(symbol)
-
-    fig = build_chart(symbol, df, label, max_bars=max_bars, ext_data=_ext_for_chart)
+    fig = build_chart(symbol, df, label, max_bars=max_bars)
     if fig:
         st.plotly_chart(fig, use_container_width=True,
                         config={"displayModeBar": True},
@@ -2462,11 +2034,6 @@ def render_single(symbol, interval, show_alerts, max_bars=90, show_pre=False, sh
         mkt = fetch_market_data() if show_market else {}
         st.markdown("---")
         render_ai_analysis(symbol, label, df, mkt=mkt)
-
-    # Extended session panel
-    if show_pre or show_post or show_night:
-        st.markdown("---")
-        render_extended_session(symbol, show_pre, show_post, show_night)
 
     # Social sentiment panel
     if show_social:
@@ -2566,12 +2133,6 @@ with st.sidebar:
     show_ai      = st.toggle("啟用 AI 技術分析",  value=True)
     show_social  = st.toggle("社群情緒面板 (StockTwits/Reddit)", value=True)
 
-    st.markdown("---")
-    st.markdown("**🌙 延長時段**")
-    show_pre   = st.toggle("📈 盤前 (Pre-market 04:00-09:30)", value=False)
-    show_post  = st.toggle("📉 盤後 (After-hours 16:00-20:00)", value=False)
-    show_night = st.toggle("🌙 夜盤 (Overnight 20:00-04:00)", value=False)
-
     if st.button("🗑️ 清除警示記錄"):
         st.session_state.alert_log   = []
         st.session_state.sent_alerts = set()
@@ -2604,7 +2165,7 @@ stock_tabs = st.tabs([f"📊 {s}" for s in symbols])
 for tab, symbol in zip(stock_tabs, symbols):
     with tab:
         if mode == "單一週期":
-            render_single(symbol, single_interval, show_alerts, max_bars=max_bars, show_pre=show_pre, show_post=show_post, show_night=show_night)
+            render_single(symbol, single_interval, show_alerts, max_bars=max_bars)
 
         else:
             if not selected:
