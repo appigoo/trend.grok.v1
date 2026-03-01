@@ -194,6 +194,54 @@ st.markdown("""
     @keyframes ai-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
     .ai-loading-dot { animation: ai-pulse 1.2s infinite; }
 
+    /* 延長時段面板 */
+    .ext-panel {
+        background:#0e1020; border-radius:12px; padding:16px 18px;
+        border:1px solid #1e2040; margin:10px 0;
+    }
+    .ext-title {
+        font-size:1rem; font-weight:700; color:#88aadd;
+        letter-spacing:0.04em; margin-bottom:12px;
+        display:flex; align-items:center; gap:8px;
+    }
+    .ext-toggle-row {
+        display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; align-items:center;
+    }
+    /* iOS 風格 toggle */
+    .ext-toggle {
+        display:inline-flex; align-items:center; gap:8px;
+        background:#141c2e; border:1px solid #2a3050;
+        border-radius:20px; padding:5px 12px 5px 6px;
+        cursor:pointer; user-select:none; font-size:0.82rem; color:#7799bb;
+        transition:all 0.2s;
+    }
+    .ext-toggle.active {
+        background:#0d2040; border-color:#3366aa; color:#66aaff;
+    }
+    .ext-toggle-dot {
+        width:18px; height:18px; border-radius:50%; background:#334466;
+        display:inline-block; transition:background 0.2s;
+    }
+    .ext-toggle.active .ext-toggle-dot { background:#4488ff; }
+    /* 時段標籤 */
+    .ext-session-tag {
+        display:inline-block; font-size:0.72rem; font-weight:700;
+        padding:2px 8px; border-radius:10px; margin-right:4px;
+    }
+    .ext-tag-pre  { background:#0d2040; color:#44aaff; border:1px solid #224488; }
+    .ext-tag-post { background:#1a1040; color:#aa88ff; border:1px solid #442288; }
+    .ext-tag-night{ background:#001830; color:#00ccff; border:1px solid #004466; }
+    /* 延長時段摘要卡片 */
+    .ext-stat-row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
+    .ext-stat-card {
+        flex:1; min-width:90px; background:#141c2e; border-radius:8px;
+        padding:8px 12px; border:1px solid #1e2e48; text-align:center;
+    }
+    .ext-stat-label { font-size:0.7rem; color:#5577aa; margin-bottom:3px; }
+    .ext-stat-val   { font-size:1rem; font-weight:700; color:#ccd6ee; }
+    .ext-stat-chg-up{ font-size:0.75rem; color:#00ee66; }
+    .ext-stat-chg-dn{ font-size:0.75rem; color:#ff5566; }
+
     /* 社群情緒面板 */
     .social-panel {
         background:#0e1525; border-radius:12px; padding:16px 18px;
@@ -1437,6 +1485,319 @@ def add_alert(symbol: str, period: str, msg: str, atype: str = "info"):
 # 數據抓取
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=60)
+# ══════════════════════════════════════════════════════════════════════════════
+# 延長時段數據（盤前 Pre-market / 盤後 After-hours / 夜盤）
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60)   # 盤前盤後每分鐘更新
+def fetch_extended_data(symbol: str) -> dict:
+    """
+    抓取盤前(pre)、盤後(post)、夜盤(overnight)數據
+    yfinance Ticker.history 支援 prepost=True 取得延長時段
+    回傳: {pre: df, post: df, regular: df, info: {...}}
+    """
+    from datetime import timezone, timedelta
+    import pytz
+
+    result = {"pre": pd.DataFrame(), "post": pd.DataFrame(),
+              "overnight": pd.DataFrame(), "regular": pd.DataFrame(),
+              "error": None}
+    try:
+        t = yf.Ticker(symbol)
+        # 抓最近 5 天 1 分鐘數據，含盤前盤後
+        df = t.history(period="5d", interval="1m",
+                       prepost=True, auto_adjust=True)
+        if df.empty:
+            result["error"] = "無數據"
+            return result
+
+        df.index = pd.to_datetime(df.index)
+        # 統一轉成 US/Eastern 時區
+        eastern = pytz.timezone("America/New_York")
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(eastern)
+        else:
+            df.index = df.index.tz_convert(eastern)
+
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        df = df.dropna(subset=["Close"])
+
+        # 取最近一個交易日（美東時間）
+        today_et = pd.Timestamp.now(tz=eastern).normalize()
+
+        def _session_df(df_all, hour_start, hour_end, date_et=None):
+            """篩選指定小時範圍（美東）"""
+            if date_et is None:
+                date_et = today_et
+            mask = (
+                (df_all.index.date == date_et.date()) &
+                (df_all.index.hour >= hour_start) &
+                (df_all.index.hour < hour_end)
+            )
+            return df_all[mask].copy()
+
+        # 正規盤：09:30–16:00
+        regular = _session_df(df, 9, 16)
+        # 盤前：04:00–09:30（含 4:00–9:29）
+        def _pre(df_all, date_et):
+            mask = (
+                (df_all.index.date == date_et.date()) &
+                (
+                    (df_all.index.hour >= 4) &
+                    ~((df_all.index.hour == 9) & (df_all.index.minute >= 30))
+                )
+            )
+            return df_all[mask].copy()
+        # 盤後：16:00–20:00
+        post = _session_df(df, 16, 20)
+        # 夜盤/前一夜：20:00–04:00（跨日）
+        yesterday_et = today_et - pd.Timedelta(days=1)
+        night_mask = (
+            (
+                (df.index.date == today_et.date()) &
+                (df.index.hour < 4)
+            ) | (
+                (df.index.date == yesterday_et.date()) &
+                (df.index.hour >= 20)
+            )
+        )
+        overnight = df[night_mask].copy()
+
+        pre = _pre(df, today_et)
+
+        # 若當天盤前沒有 → 用前一日盤前
+        if pre.empty:
+            pre = _pre(df, yesterday_et)
+        if regular.empty:
+            regular = _session_df(df, 9, 16, yesterday_et)
+        if post.empty:
+            post = _session_df(df, 16, 20, yesterday_et)
+
+        def _summary(session_df, ref_close=None):
+            if session_df.empty:
+                return None
+            first = float(session_df["Close"].iloc[0])
+            last  = float(session_df["Close"].iloc[-1])
+            hi    = float(session_df["High"].max())
+            lo    = float(session_df["Low"].min())
+            vol   = int(session_df["Volume"].sum())
+            chg   = last - (ref_close or first)
+            pct   = chg / (ref_close or first) * 100 if (ref_close or first) else 0
+            return {"open": first, "close": last, "high": hi, "low": lo,
+                    "volume": vol, "chg": chg, "pct": pct,
+                    "bars": len(session_df)}
+
+        reg_close = float(regular["Close"].iloc[-1]) if not regular.empty else None
+
+        result.update({
+            "pre":       pre,
+            "post":      post,
+            "overnight": overnight,
+            "regular":   regular,
+            "pre_info":       _summary(pre, reg_close),
+            "post_info":      _summary(post, reg_close),
+            "overnight_info": _summary(overnight, reg_close),
+            "regular_info":   _summary(regular),
+            "reg_close":      reg_close,
+        })
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+def render_extended_session(symbol: str, show_pre: bool, show_post: bool, show_night: bool):
+    """渲染延長時段面板：盤前 / 盤後 / 夜盤 K 線 + 摘要"""
+    if not any([show_pre, show_post, show_night]):
+        return
+
+    with st.spinner("載入延長時段數據..."):
+        ext = fetch_extended_data(symbol)
+
+    if ext.get("error"):
+        st.warning(f"延長時段數據載入失敗：{ext['error']}")
+        return
+
+    st.markdown(
+        '<div class="ext-panel"><div class="ext-title">🌙 延長時段</div>',
+        unsafe_allow_html=True)
+
+    # ── 摘要卡片行 ───────────────────────────────────────────────────────────
+    reg_close = ext.get("reg_close")
+    stat_parts = []
+
+    session_cfg = [
+        ("pre",       show_pre,   "盤前", "ext-tag-pre",   "📈"),
+        ("post",      show_post,  "盤後", "ext-tag-post",  "📉"),
+        ("overnight", show_night, "夜盤", "ext-tag-night", "🌙"),
+    ]
+
+    for key, enabled, name, tag_cls, icon in session_cfg:
+        if not enabled:
+            continue
+        info = ext.get(f"{key}_info")
+        if not info:
+            stat_parts.append(
+                f'<div class="ext-stat-card">'
+                f'<div class="ext-stat-label"><span class="ext-session-tag {tag_cls}">{name}</span></div>'
+                f'<div class="ext-stat-val" style="color:#445566;">無數據</div>'
+                f'</div>'
+            )
+            continue
+        chg_cls = "ext-stat-chg-up" if info["chg"] >= 0 else "ext-stat-chg-dn"
+        arrow   = "▲" if info["chg"] >= 0 else "▼"
+        stat_parts.append(
+            f'<div class="ext-stat-card">'
+            f'<div class="ext-stat-label"><span class="ext-session-tag {tag_cls}">{name}</span></div>'
+            f'<div class="ext-stat-val">${info["close"]:.2f}</div>'
+            f'<div class="{chg_cls}">{arrow} {info["chg"]:+.2f} ({info["pct"]:+.2f}%)</div>'
+            f'<div style="font-size:0.68rem;color:#334455;margin-top:3px;">'
+            f'H:{info["high"]:.2f}　L:{info["low"]:.2f}　{info["bars"]}根</div>'
+            f'</div>'
+        )
+
+    if stat_parts:
+        st.markdown(
+            '<div class="ext-stat-row">' + "".join(stat_parts) + '</div>',
+            unsafe_allow_html=True)
+
+    # ── 合併圖表：正規盤 + 選擇的延長時段 ─────────────────────────────────
+    frames_to_plot = []
+    colors_map = {}
+
+    if not ext["regular"].empty:
+        regular_plot = ext["regular"].copy()
+        regular_plot["_session"] = "regular"
+        frames_to_plot.append(regular_plot)
+
+    if show_pre and not ext["pre"].empty:
+        pre_plot = ext["pre"].copy()
+        pre_plot["_session"] = "pre"
+        frames_to_plot.append(pre_plot)
+
+    if show_post and not ext["post"].empty:
+        post_plot = ext["post"].copy()
+        post_plot["_session"] = "post"
+        frames_to_plot.append(post_plot)
+
+    if show_night and not ext["overnight"].empty:
+        night_plot = ext["overnight"].copy()
+        night_plot["_session"] = "overnight"
+        frames_to_plot.append(night_plot)
+
+    if not frames_to_plot:
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    combined = pd.concat(frames_to_plot).sort_index()
+
+    # 轉成 category x-axis（消除休市空白）
+    fmt = "%m/%d %H:%M"
+    xlabels = [t.strftime(fmt) for t in combined.index]
+
+    # 決定 K 線顏色（正規盤標準色，延長時段稍淡）
+    def _candle_colors(df_slice, session):
+        ups   = df_slice["Close"] >= df_slice["Open"]
+        if session == "regular":
+            c_up, c_dn = "#00cc44", "#ff4444"
+        elif session == "pre":
+            c_up, c_dn = "#44aaff", "#aa44ff"   # 藍/紫（盤前）
+        elif session == "post":
+            c_up, c_dn = "#00aacc", "#cc6600"   # 青/橘（盤後）
+        else:
+            c_up, c_dn = "#008888", "#884400"   # 深青/深橘（夜盤）
+        return [c_up if u else c_dn for u in ups]
+
+    # 用 OHLC bar 而不是 Candlestick（支援 marker_color per-bar）
+    # 分 session 分別畫 Candlestick trace
+    fig = go.Figure()
+
+    session_meta = {
+        "regular": ("正規盤", "#00cc44", "#ff4444"),
+        "pre":     ("盤前",   "#44aaff", "#aa44ff"),
+        "post":    ("盤後",   "#00aacc", "#cc6600"),
+        "overnight":("夜盤",  "#00bbbb", "#886600"),
+    }
+
+    # 為每個 session 建一條 Candlestick trace
+    plotted_sessions = combined["_session"].unique() if "_session" in combined.columns else []
+    x_all = xlabels  # 全部 x 軸用 combined 的 label
+
+    for sess in ["overnight", "pre", "regular", "post"]:
+        if sess not in plotted_sessions:
+            continue
+        mask = combined["_session"] == sess
+        idx_list = [i for i, m in enumerate(mask) if m]
+        if not idx_list:
+            continue
+        xs  = [xlabels[i] for i in idx_list]
+        sub = combined[mask]
+        name_, c_up, c_dn = session_meta[sess]
+        fig.add_trace(go.Candlestick(
+            x=xs,
+            open=sub["Open"], high=sub["High"],
+            low=sub["Low"],   close=sub["Close"],
+            name=name_,
+            increasing_line_color=c_up, increasing_fillcolor=c_up,
+            decreasing_line_color=c_dn, decreasing_fillcolor=c_dn,
+        ))
+
+    # 正規收盤參考線
+    if reg_close:
+        fig.add_hline(
+            y=reg_close, line_dash="dot", line_color="#ffcc0066",
+            line_width=1,
+            annotation_text=f"收盤 ${reg_close:.2f}",
+            annotation_font_color="#ffcc00",
+            annotation_font_size=10,
+        )
+
+    fig.update_layout(
+        height=320,
+        paper_bgcolor="#0a0e18", plot_bgcolor="#0a0e18",
+        font=dict(color="#aabbcc", size=10),
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(orientation="h", y=1.08, x=0,
+                    bgcolor="rgba(0,0,0,0)", font_size=10),
+        xaxis=dict(
+            type="category",
+            tickangle=-35,
+            tickfont=dict(size=8, color="#556688"),
+            gridcolor="#151c2e", showgrid=True,
+            rangeslider=dict(visible=False),
+        ),
+        yaxis=dict(
+            tickfont=dict(size=9, color="#556688"),
+            gridcolor="#151c2e", showgrid=True,
+            side="right",
+        ),
+    )
+
+    # Category axis + 每 N 個 tick 顯示一個
+    n_labels = len(xlabels)
+    step = max(1, n_labels // 10)
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=xlabels[::step],
+        ticktext=xlabels[::step],
+    )
+
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"ext_{symbol}")
+
+    # 色例說明
+    legend_html = (
+        '<div style="font-size:0.72rem;color:#445566;margin-top:4px;display:flex;gap:12px;">'
+        '<span style="color:#44aaff">■ 盤前</span>'
+        '<span style="color:#00cc44">■ 正規盤↑</span>'
+        '<span style="color:#ff4444">■ 正規盤↓</span>'
+        '<span style="color:#00aacc">■ 盤後</span>'
+        '<span style="color:#00bbbb">■ 夜盤</span>'
+        '</div>'
+    )
+    st.markdown(legend_html + '</div>', unsafe_allow_html=True)
+
+
 def fetch_data(symbol: str, interval: str) -> pd.DataFrame:
     _, period = INTERVAL_MAP[interval]
     try:
@@ -2034,6 +2395,11 @@ def render_single(symbol, interval, show_alerts, max_bars=90):
         st.markdown("---")
         render_ai_analysis(symbol, label, df, mkt=mkt)
 
+    # Extended session panel
+    if show_pre or show_post or show_night:
+        st.markdown("---")
+        render_extended_session(symbol, show_pre, show_post, show_night)
+
     # Social sentiment panel
     if show_social:
         st.markdown("---")
@@ -2131,6 +2497,12 @@ with st.sidebar:
     show_market  = st.toggle("顯示市場環境面板",   value=True)
     show_ai      = st.toggle("啟用 AI 技術分析",  value=True)
     show_social  = st.toggle("社群情緒面板 (StockTwits/Reddit)", value=True)
+
+    st.markdown("---")
+    st.markdown("**🌙 延長時段**")
+    show_pre   = st.toggle("📈 盤前 (Pre-market 04:00-09:30)", value=False)
+    show_post  = st.toggle("📉 盤後 (After-hours 16:00-20:00)", value=False)
+    show_night = st.toggle("🌙 夜盤 (Overnight 20:00-04:00)", value=False)
 
     if st.button("🗑️ 清除警示記錄"):
         st.session_state.alert_log   = []
