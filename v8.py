@@ -1645,7 +1645,7 @@ def build_chart(symbol, df, interval_label, compact=False, max_bars=90):
 
     # ── 消除休市空白：把 DatetimeIndex 轉成字串當 category label ──────────
     # Plotly category 軸只顯示實際存在的類別，自動跳過休市間隙
-    intraday = interval_label in {"1分鐘","5分鐘","15分鐘","30分鐘"}
+    intraday = interval_label in {"1分鐘","2分鐘","5分鐘","15分鐘","30分鐘","60分鐘"}
     fmt = "%m/%d %H:%M" if intraday else "%y/%m/%d"
     xlabels = [t.strftime(fmt) for t in df.index]
     # 所有 series 也配對成同樣的字串 index，確保對齊
